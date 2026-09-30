@@ -1,0 +1,11 @@
+framesviewer>=1.0.2
+jax[cuda12]==0.4.38
+jaxlib==0.4.38
+jaxtyping>=0.2.38
+matplotlib>=3.10.0
+mediapy>=1.2.2
+onnxruntime>=1.20.1
+playground>=0.0.3
+pygame>=2.6.1
+tensorflow>=2.18.0
+tf2onnx>=1.16.1
