@@ -239,3 +239,60 @@ def reward_feet_phase(
     # cmd_norm = jp.linalg.norm(commands)
     # reward *= cmd_norm > 0.1  # No reward for zero commands.
     return jp.nan_to_num(reward)
+
+# =============================================================================
+# Roll / flip specific rewards
+# =============================================================================
+
+def reward_roll_angular_velocity(
+    gyro: jax.Array,
+    axis: int = 0,
+    target_vel: float = 6.0,
+    sigma: float = 4.0,
+) -> jax.Array:
+    """Reward spinning around a chosen body axis.
+
+    Args:
+        gyro: body-frame angular velocity (3,).
+        axis: 0=x(roll), 1=y(pitch), 2=z(yaw). For a forward roll on Open Duck
+              Mini, the body x-axis is usually the "forward / roll" axis.
+        target_vel: desired angular speed (rad/s) around that axis.
+        sigma: shaping width. Larger = more forgiving.
+    """
+    err = jp.square(gyro[axis] - target_vel)
+    return jp.nan_to_num(jp.exp(-err / sigma))
+
+
+def cost_non_roll_rotation(
+    gyro: jax.Array,
+    axis: int = 0,
+) -> jax.Array:
+    """Penalise rotation around the two axes that are NOT the roll axis."""
+    axes = [i for i in range(3) if i != axis]
+    return jp.nan_to_num(jp.sum(jp.square(gyro[jp.array(axes)])))
+
+
+def reward_roll_progress(
+    gravity: jax.Array,
+    axis: int = 0,
+) -> jax.Array:
+    """Dense reward for making progress through the roll.
+
+    `gravity` is the body-frame gravity vector (unit). When the robot is
+    upright, gravity ~= [0, 0, -1]. While rolling around `axis`, the component
+    along that axis sweeps from 0 -> +1 -> 0 -> -1 -> 0. We reward the absolute
+    component so the policy gets signal on both halves of the flip.
+    """
+    return jp.nan_to_num(jp.abs(gravity[axis]))
+
+
+def cost_roll_base_height(
+    base_height: jax.Array,
+    target_height: float,
+) -> jax.Array:
+    """Keep the base low during the roll (crouched / tucked).
+
+    Rolling from a tall standing pose is hard; a tucked pose helps. This cost
+    is intentionally soft so it does not block early exploration.
+    """
+    return jp.nan_to_num(jp.square(base_height - target_height))

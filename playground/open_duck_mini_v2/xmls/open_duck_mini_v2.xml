@@ -111,6 +111,12 @@
         <!-- Frame imu -->
         <!-- <site group="0" name="imu" pos="-0.08711 1.249e-16 0.0422909" quat="1 -7.03105e-17 -2.77556e-17
         -3.14419e-16"/> -->
+        <!-- Collision geom for rolling / tumbling -->
+        <geom name="trunk_collision" type="capsule"
+              fromto="-0.06 0 0.02 0.02 0 0.11"
+              size="0.045"
+              contype="1" conaffinity="1"
+              rgba="1 0 0 0.3"/>
         <!-- Link hip_roll_assembly -->
         <body name="hip_roll_assembly" pos="-0.019 0.035 0.0459409" quat="1 -1.17663e-16 -1.09357e-14 2.77556e-17">
           <!-- Joint from trunk_assembly to hip_roll_assembly -->
@@ -288,6 +294,12 @@
                 <!-- Part head_2 -->
                 <geom type="mesh" class="visual" pos="-0.12906 1.92717e-17 0.06095"
                   quat="0.707107 2.80428e-16 0.707107 5.82867e-16" mesh="head" material="head_material"/>
+                        <!-- Collision geom for rolling / tumbling -->
+                <geom name="head_collision" type="sphere"
+                  pos="-0.13 0 0.06"
+                  size="0.05"
+                  contype="1" conaffinity="1"
+                  rgba="0 1 0 0.3"/>
                 <!-- Part bulb -->
                 <!-- Part glass -->
                 <!-- Part head_roll_mount -->

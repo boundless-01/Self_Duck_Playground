@@ -4,7 +4,7 @@ import argparse
 
 from playground.common import randomize
 from playground.common.runner import BaseRunner
-from playground.open_duck_mini_v2 import joystick, standing
+from playground.open_duck_mini_v2 import joystick, standing, roll
 
 
 class OpenDuckMiniV2Runner(BaseRunner):
@@ -14,6 +14,7 @@ class OpenDuckMiniV2Runner(BaseRunner):
         available_envs = {
             "joystick": (joystick, joystick.Joystick),
             "standing": (standing, standing.Standing),
+            "roll": (roll, roll.Roll),
         }
         if args.env not in available_envs:
             raise ValueError(f"Unknown env {args.env}")
