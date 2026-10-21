@@ -272,19 +272,15 @@ def cost_non_roll_rotation(
     return jp.nan_to_num(jp.sum(jp.square(gyro[jp.array(axes)])))
 
 
-def reward_roll_progress(
-    gravity: jax.Array,
-    axis: int = 0,
-) -> jax.Array:
-    """Dense reward for making progress through the roll.
+def reward_roll_progress(gravity, axis=1):
+    """奖励“从站立翻到倒立”的进度。
 
-    `gravity` is the body-frame gravity vector (unit). When the robot is
-    upright, gravity ~= [0, 0, -1]. While rolling around `axis`, the component
-    along that axis sweeps from 0 -> +1 -> 0 -> -1 -> 0. We reward the absolute
-    component so the policy gets signal on both halves of the flip.
+    站立: gravity ~= [0, 0, -1] -> progress = 0
+    侧躺: gravity ~= [0, ±1, 0] -> progress = 0.5
+    倒立: gravity ~= [0, 0, +1] -> progress = 1.0
     """
-    return jp.nan_to_num(jp.abs(gravity[axis]))
-
+    progress = (gravity[-1] + 1.0) / 2.0   # -1 -> 0, +1 -> 1
+    return jp.clip(progress, 0.0, 1.0)
 
 def cost_roll_base_height(
     base_height: jax.Array,

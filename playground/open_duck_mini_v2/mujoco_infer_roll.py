@@ -103,6 +103,11 @@ class MjInferRoll(MJInferBase):
             self.max_roll = 0.0
             print("reset roll bookkeeping")
 
+    def get_gravity(self, data):
+        """直接从 imu site 的旋转矩阵算 z 轴，绕过传感器布局问题。"""
+        imu_site_id = self.model.site("imu").id
+        return data.site_xmat[imu_site_id].reshape(3, 3)[:, 2]
+    
     # ----------------------------------------------------------------------
     # Main loop
     # ----------------------------------------------------------------------
@@ -155,6 +160,32 @@ class MjInferRoll(MJInferBase):
                                 f"|act|={np.linalg.norm(action):.2f}"
                             )
 
+                            # ---- Debug: imu site 旋转矩阵 + base 四元数 ------------------
+                            imu_site_id = self.model.site("imu").id
+                            imu_xmat = self.data.site_xmat[imu_site_id].reshape(3, 3)
+                            base_quat = self.data.qpos[3:7]
+                            quat_norm = np.linalg.norm(base_quat)
+
+                            # 从旋转矩阵提取 z 轴（应该等于 upvector）
+                            imu_zaxis = imu_xmat[:, 2]
+
+                            print(
+                                f"    imu_xmat z-axis: {np.round(imu_zaxis, 3)} "
+                                f"(norm={np.linalg.norm(imu_zaxis):.3f})"
+                            )
+                            print(
+                                f"    base_quat: {np.round(base_quat, 3)} "
+                                f"(norm={quat_norm:.4f})"
+                            )
+
+                            print(f"gravity_id: {self.gravity_id}, dim: {self.gravity_dimensions}")
+
+                            # 看看 upvector 实际在哪个地址
+                            upvector_id = self.model.sensor("upvector").id
+                            print(f"upvector sensor id: {upvector_id}")
+                            print(f"upvector sensor adr: {self.model.sensor_adr[upvector_id]}")
+                            print(f"upvector sensor dim: {self.model.sensor_dim[upvector_id]}")
+
                         # Shift action history
                         self.last_last_last_action = self.last_last_action.copy()
                         self.last_last_action = self.last_action.copy()
@@ -202,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_path",
         type=str,
-        default="playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml",
+        default="playground/open_duck_mini_v2/xmls/scene_flat_terrain_roll.xml",
     )
 
     args = parser.parse_args()

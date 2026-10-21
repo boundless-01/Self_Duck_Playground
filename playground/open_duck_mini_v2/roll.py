@@ -57,6 +57,10 @@ ROLL_PHASE = 0
 
 # Which body axis to roll around. 0 = x (side roll), 1 = y (forward roll).
 ROLL_AXIS = 1
+# Right-handed robot frame: +X forward, +Y left, +Z up.
+# A positive rotation about +Y pitches the +X/front direction downward.
+FLIP_DIRECTION = 1.0
+ROLL_SUCCESS_ANGLE = 2.0 * np.pi
 
 USE_MOTOR_SPEED_LIMITS = True
 
@@ -66,7 +70,7 @@ def default_config() -> config_dict.ConfigDict:
         ctrl_dt=0.02,
         sim_dt=0.002,
         # Rolls are short. 250 steps @ 0.02s = 5s, plenty.
-        episode_length=250,
+        episode_length=1250,
         action_repeat=1,
         action_scale=0.25,
         dof_vel_scale=0.05,
@@ -74,11 +78,13 @@ def default_config() -> config_dict.ConfigDict:
         soft_joint_pos_limit_factor=0.95,
         max_motor_velocity=5.24,  # rad/s
         noise_config=config_dict.create(
-            level=1.0,
+            # Start without injected observation noise or delays. Re-enable
+            # gradually after the basic roll is learned.
+            level=0.0,
             action_min_delay=0,
-            action_max_delay=3,
+            action_max_delay=1,  # randint upper bound is exclusive: delay=0 only
             imu_min_delay=0,
-            imu_max_delay=3,
+            imu_max_delay=1,     # delay=0 only
             scales=config_dict.create(
                 hip_pos=0.03,
                 knee_pos=0.05,
@@ -92,15 +98,23 @@ def default_config() -> config_dict.ConfigDict:
         ),
         reward_config=config_dict.create(
             scales=config_dict.create(
-                roll_velocity=4.0,
+                # Progress reward is based on the *change* in normalized
+                # forward-roll angle, not the current angle every timestep.
+                roll_velocity=1.0,
                 non_roll_rotation=-0.5,
-                roll_progress=2.0,
-                base_height=-0.5,
-                torques=-1.0e-3,
-                action_rate=-0.5,
-                alive=5.0,
-                # Only active in phase 1
-                landing=-2.0,
+                roll_progress=0.0,       # Disable gravity-based half-flip proxy.
+                roll_progress_delta=8.0,
+                roll_success=20.0,       # One-time terminal achievement bonus.
+                base_height=-0.1,
+                torques=-1.0e-4,
+                action_rate=-0.05,
+                alive=0.2,
+                stagnation=0.5,
+                roll_accumulated=0.0,    # Disable repeated reward for current total.
+                side_roll_penalty=-0.5,
+                tuck_pose=1.0,
+                # Shaping only after one full turn; also useful in phase 0.
+                landing=2.0,
             ),
             roll_target_vel=6.0,
             roll_sigma=4.0,
@@ -119,7 +133,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
     def __init__(
         self,
-        task: str = "flat_terrain",
+        task: str = "flat_terrain_roll",
         config: config_dict.ConfigDict = default_config(),
         config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
     ):
@@ -209,22 +223,18 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         base_qpos = base_qpos.at[3:7].set(new_quat)
         qpos = self.set_floating_base_qpos(base_qpos, qpos)
 
-        # Joint position noise.
+        # Start close to the model's home pose. Large multiplicative joint
+        # randomization and random tuck biases make the initial task needlessly
+        # inconsistent, so use only small additive joint noise while debugging.
         rng, key = jax.random.split(rng)
-        qpos_j = self.get_actuator_joints_qpos(qpos) * jax.random.uniform(
-            key, (self._actuators,), minval=0.5, maxval=1.5
+        joint_qpos = self.get_actuator_joints_qpos(qpos)
+        joint_noise = jax.random.uniform(
+            key, (self._actuators,), minval=-0.02, maxval=0.02
         )
-        qpos = self.set_actuator_joints_qpos(qpos_j, qpos)
+        qpos = self.set_actuator_joints_qpos(joint_qpos + joint_noise, qpos)
 
-        # Small random base velocity, including a little roll spin so the
-        # policy gets to feel the motion early on.
-        rng, key = jax.random.split(rng)
-        base_vel = jax.random.uniform(key, (6,), minval=-0.05, maxval=0.05)
-        # base_vel[3] is roll rate in the floating-base qvel layout (xyz rpy).
-        base_vel = base_vel.at[4].set(
-            jax.random.uniform(key, (), minval=-0.5, maxval=0.5)
-        )
-        qvel = self.set_floating_base_qvel(base_vel, qvel)
+        # Zero initial velocity: the policy must create the roll itself.
+        qvel = jp.zeros(self.mjx_model.nv)
 
         ctrl = self.get_actuator_joints_qpos(qpos)
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
@@ -249,6 +259,9 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # Roll bookkeeping: how far around the roll axis we have gone.
             "accumulated_roll": jp.array(0.0),
             "max_roll": jp.array(0.0),
+            "roll_progress_delta": jp.array(0.0),
+            "roll_success": jp.array(False),
+            "roll_success_now": jp.array(0.0),
         }
 
         metrics = {}
@@ -260,6 +273,9 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                     metrics[f"cost/{k}"] = jp.zeros(())
         metrics["swing_peak"] = jp.zeros(())
         metrics["max_roll"] = jp.zeros(())
+        metrics["roll_fraction"] = jp.zeros(())
+        metrics["accumulated_roll_rad"] = jp.zeros(())
+        metrics["roll_success"] = jp.zeros(())
 
         contact = jp.array(
             [
@@ -320,10 +336,46 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         p_fz = p_f[..., -1]
         state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
 
-        # Track roll progress using the body-frame gravity component.
+        # Track signed forward-roll angle. Positive progress means rotation
+        # in the intended forward direction; reverse rotation reduces it.
+        gyro = self.get_gyro(data)
         gravity = self.get_gravity(data)
-        roll_progress = jp.abs(gravity[ROLL_AXIS])
-        state.info["max_roll"] = jp.maximum(state.info["max_roll"], roll_progress)
+        old_roll = state.info["accumulated_roll"]
+        signed_roll_velocity = FLIP_DIRECTION * gyro[ROLL_AXIS]
+        roll_delta = signed_roll_velocity * self.dt
+
+        # Keep up to two turns of angular bookkeeping so a policy can recover
+        # its upright posture even if it overshoots the first revolution.
+        new_roll = jp.clip(
+            old_roll + roll_delta, 0.0, 2.0 * ROLL_SUCCESS_ANGLE
+        )
+        old_progress = jp.clip(old_roll / ROLL_SUCCESS_ANGLE, 0.0, 1.0)
+        new_progress = jp.clip(new_roll / ROLL_SUCCESS_ANGLE, 0.0, 1.0)
+        state.info["accumulated_roll"] = new_roll
+
+        # _get_reward is a reward-rate function and step() multiplies it by dt.
+        # Divide by dt here so the integrated progress bonus is scale * delta
+        # progress, independent of control frequency.
+        state.info["roll_progress_delta"] = (
+            new_progress - old_progress
+        ) / self.dt
+        state.info["max_roll"] = jp.maximum(
+            state.info["max_roll"], new_progress
+        )
+
+        base_height_now = data.qpos[self._floating_base_qpos_addr + 2]
+        upright_now = gravity[-1] < -0.7
+        feet_touching_now = jp.any(contact)
+        roll_complete_now = new_roll >= ROLL_SUCCESS_ANGLE
+        success_condition = (
+            roll_complete_now
+            & upright_now
+            & (base_height_now > 0.10)
+            & feet_touching_now
+        )
+        success_now = success_condition & (~state.info["roll_success"])
+        state.info["roll_success_now"] = success_now.astype(jp.float32)
+        state.info["roll_success"] = state.info["roll_success"] | success_now
 
         obs = self._get_obs(data, state.info, contact)
         done = self._get_termination(data, state.info)
@@ -334,7 +386,8 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         rewards = {
             k: v * self._config.reward_config.scales[k] for k, v in rewards.items()
         }
-        reward = jp.clip(sum(rewards.values()) * self.dt, 0.0, 10000.0)
+        reward = sum(rewards.values()) * self.dt
+        reward = jp.clip(reward, -100.0, 10000.0)
 
         state.info["step"] += 1
         state.info["last_last_last_act"] = state.info["last_last_act"]
@@ -343,7 +396,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         state.info["feet_air_time"] *= ~contact
         state.info["last_contact"] = contact
         state.info["swing_peak"] *= ~contact
-
+        
         for k, v in rewards.items():
             rew_scale = self._config.reward_config.scales[k]
             if rew_scale != 0:
@@ -353,6 +406,11 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                     state.metrics[f"cost/{k}"] = -v
         state.metrics["swing_peak"] = jp.mean(state.info["swing_peak"])
         state.metrics["max_roll"] = state.info["max_roll"]
+        state.metrics["roll_fraction"] = jp.clip(
+            state.info["accumulated_roll"] / ROLL_SUCCESS_ANGLE, 0.0, 1.0
+        )
+        state.metrics["accumulated_roll_rad"] = state.info["accumulated_roll"]
+        state.metrics["roll_success"] = state.info["roll_success"].astype(jp.float32)
 
         done = done.astype(reward.dtype)
         state = state.replace(data=data, obs=obs, reward=reward, done=done)
@@ -369,10 +427,9 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # Phase 0: do not terminate on orientation. Let it tumble.
             return nan_term
 
-        # Phase 1: terminate if the robot is clearly on its back / side and
-        # not moving, i.e. a failed landing. We use "gravity z very negative"
-        # to mean upside down, and require it to persist a bit.
-        upside_down = self.get_gravity(data)[-1] < -0.5
+        # In this frame, upright has gravity_z ~= -1 and upside-down ~= +1.
+        # Phase 1 uses this as a simple failure termination condition.
+        upside_down = self.get_gravity(data)[-1] > 0.5
         return nan_term | upside_down
 
     # ------------------------------------------------------------------
@@ -449,12 +506,12 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             [
                 noisy_gyro,  # 3
                 noisy_accelerometer,  # 3
-                noisy_joint_angles - self._default_actuator,  # 10
-                noisy_joint_vel * self._config.dof_vel_scale,  # 10
-                info["last_act"],  # 10
-                info["last_last_act"],  # 10
-                info["last_last_last_act"],  # 10
-                info["motor_targets"],  # 10
+                noisy_joint_angles - self._default_actuator,  # 14
+                noisy_joint_vel * self._config.dof_vel_scale,  # 14
+                info["last_act"],  # 14
+                info["last_last_act"],  # 14
+                info["last_last_last_act"],  # 14
+                info["motor_targets"],  # 14
                 contact,  # 2
             ]
         )
@@ -500,35 +557,67 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         first_contact: jax.Array,
         contact: jax.Array,
     ) -> dict[str, jax.Array]:
-        del metrics, done, first_contact, contact
+        del metrics, done, first_contact
 
         gyro = self.get_gyro(data)
         gravity = self.get_gravity(data)
         base_height = data.qpos[self._floating_base_qpos_addr + 2]
+        signed_roll_velocity = FLIP_DIRECTION * gyro[ROLL_AXIS]
+
+                # Actuator joint order:
+        # left_hip_pitch, left_knee, right_hip_pitch, right_knee
+        tuck_target = jp.array([1.0, 1.5, -1.0, 1.5])
+        joint_angles = self.get_actuator_joints_qpos(data.qpos)
+        tuck_angles = joint_angles[jp.array([2, 3, 11, 12])]
+
+        tuck_error = jp.mean(jp.square(tuck_angles - tuck_target))
+        tuck_reward = jp.exp(-tuck_error / 0.25)
+
+        # Reward only motion in the intended direction; cap the rate reward
+        # so spinning as fast as possible cannot dominate completion.
+        target_vel = self._config.reward_config.roll_target_vel
+        forward_velocity_reward = jp.clip(
+            signed_roll_velocity / jp.maximum(target_vel, 1e-6), 0.0, 1.0
+        )
+
+        # Once one turn has been accumulated, encourage the robot to become
+        # upright again. This shaping is zero before the first full turn.
+        has_completed_rotation = (
+            info["accumulated_roll"] >= ROLL_SUCCESS_ANGLE
+        )
+        upright_shaping = jp.where(
+            has_completed_rotation,
+            jp.clip(-gravity[-1], 0.0, 1.0),
+            0.0,
+        )
 
         ret = {
-            "roll_velocity": reward_roll_angular_velocity(
-                gyro,
-                axis=ROLL_AXIS,
-                target_vel=self._config.reward_config.roll_target_vel,
-                sigma=self._config.reward_config.roll_sigma,
-            ),
+            "roll_velocity": forward_velocity_reward,
             "non_roll_rotation": cost_non_roll_rotation(gyro, axis=ROLL_AXIS),
-            "roll_progress": reward_roll_progress(gravity, axis=ROLL_AXIS),
+            # Kept for config compatibility; deliberately disabled in scales.
+            "roll_progress": jp.array(0.0),
+            "roll_progress_delta": info["roll_progress_delta"],
             "base_height": cost_roll_base_height(
                 base_height, self._config.reward_config.tuck_height
             ),
             "torques": cost_torques(data.actuator_force),
             "action_rate": cost_action_rate(action, info["last_act"]),
             "alive": reward_alive(),
+            # Deliberately zero: repeatedly rewarding accumulated angle lets
+            # the policy camp at a partially completed pose.
+            "roll_accumulated": jp.array(0.0),
+            "side_roll_penalty": jp.abs(gyro[0]),
+            # Penalize lack of correctly-directed progress, not merely lack
+            # of absolute angular speed.
+            "stagnation": -jp.clip(
+                1.0 - jp.maximum(signed_roll_velocity, 0.0) / 0.5,
+                0.0, 1.0
+            ),
+            "tuck_pose": tuck_reward,
+            "landing": upright_shaping,
+            # Divide by dt because step() multiplies the summed reward by dt.
+            # Thus a success bonus of 20 is paid once, not every frame.
+            "roll_success": info["roll_success_now"] / self.dt,
         }
-
-        # Landing term only meaningful in phase 1.
-        if ROLL_PHASE == 1:
-            # Reward being upright again at the end of the episode.
-            upright = jp.clip(gravity[-1], 0.0, 1.0)
-            ret["landing"] = upright
-        else:
-            ret["landing"] = jp.array(0.0)
 
         return ret

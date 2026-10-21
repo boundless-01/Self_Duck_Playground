@@ -86,11 +86,24 @@ class BaseRunner(ABC):
     def train(self) -> None:
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
-        )  # TODO
-        self.ppo_training_params = dict(self.ppo_params)
-        # self.ppo_training_params["num_timesteps"] = 150000000 * 20
-        
+        )
+        self.ppo_training_params = dict(self.ppo_params)  # 先建
 
+        # 按任务选择 PPO 配置
+        if self.args.env == "roll":
+            self.ppo_params.unlock()   # 解锁
+            self.ppo_params.num_timesteps = self.num_timesteps
+            self.ppo_params.episode_length = 1250          # 与 roll.py 的 episode_length 一致
+            self.ppo_params.num_envs = 4096               # 可按 GPU 显存调
+            self.ppo_params.learning_rate = 3e-4
+            self.ppo_params.entropy_cost = 1e-2           # 翻滚探索性强，熵可以大一点
+            self.ppo_params.discounting = 0.97
+            # 网络结构：翻滚观测 92 维、动作 14 维，和默认一致的话不用改
+        else:
+            # 走路 / 站立沿用原配置
+            self.ppo_training_params["num_timesteps"] = self.num_timesteps
+
+        self.ppo_training_params = dict(self.ppo_params)  # 先复制
         if "network_factory" in self.ppo_params:
             network_factory = functools.partial(
                 ppo_networks.make_ppo_networks, **self.ppo_params.network_factory
@@ -98,6 +111,7 @@ class BaseRunner(ABC):
             del self.ppo_training_params["network_factory"]
         else:
             network_factory = ppo_networks.make_ppo_networks
+
         self.ppo_training_params["num_timesteps"] = self.num_timesteps
         print(f"PPO params: {self.ppo_training_params}")
 
