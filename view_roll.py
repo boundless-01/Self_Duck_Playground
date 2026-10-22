@@ -10,16 +10,16 @@ data = mujoco.MjData(model)
 paused = False
 
 # ===== 可调参数 =====
-BEND_ANGLE   = 1.4    # 弯腰角度（髋关节），越大弯得越深
+BEND_ANGLE   = 1.0    # 弯腰角度（髋关节），关节上限约 1.22
 ANKLE_COMP   = -1.0   # 踝关节补偿，让脚掌保持贴地（符号要试）
-NECK_PITCH   = -0.5   # 脖子低头
-HEAD_PITCH   = -1.0   # 头再低
+NECK_PITCH   = -0.3   # 脖子低头，关节下限约 -0.349
+HEAD_PITCH   = -0.7   # 头再低，关节下限约 -0.785
 HEIGHT       = 0.22   # 身体高度（腿直立时的站立高度，需按模型调）
 
 def set_bend_pose():
     """腿直立，从髋关节弯腰，低头。"""
-    data.qpos[:] = 0        # 先归零，避免残留
-    data.qpos[2] = HEIGHT   # 高度
+    data.qpos[:] = model.keyframe("home").qpos  # 保留有效的基座四元数
+    data.qpos[2] = HEIGHT                       # 高度
 
     # ---- 腿：膝盖锁 0，保持直立 ----
     # 左腿
@@ -27,7 +27,7 @@ def set_bend_pose():
     data.qpos[10] = 0.0          # left_knee       -> 直立
     data.qpos[11] = ANKLE_COMP   # left_ankle      -> 脚掌贴地补偿
     # 右腿
-    data.qpos[18] = BEND_ANGLE   # right_hip_pitch
+    data.qpos[18] = -BEND_ANGLE  # right_hip_pitch，轴向与左髋相反
     data.qpos[19] = 0.0          # right_knee
     data.qpos[20] = ANKLE_COMP   # right_ankle
 

@@ -39,9 +39,7 @@ from mujoco_playground._src.collision import geoms_colliding
 from . import constants
 from . import base as open_duck_mini_v2_base
 from playground.common.rewards import (
-    reward_roll_angular_velocity,
     cost_non_roll_rotation,
-    reward_roll_progress,
     cost_roll_base_height,
     cost_torques,
     cost_action_rate,
@@ -69,10 +67,13 @@ def default_config() -> config_dict.ConfigDict:
     return config_dict.create(
         ctrl_dt=0.02,
         sim_dt=0.002,
-        # Rolls are short. 250 steps @ 0.02s = 5s, plenty.
-        episode_length=1250,
+        # A roll plus landing should fit in 10s. Long episodes make repeated
+        # ground contact jitter a viable local optimum.
+        episode_length=500,
         action_repeat=1,
-        action_scale=0.25,
+        # The policy output is bounded to [-1, 1]. A 0.25 scale only permits
+        # +/-0.25 rad around home and cannot reach the tuck pose.
+        action_scale=1.8,
         dof_vel_scale=0.05,
         history_len=0,
         soft_joint_pos_limit_factor=0.95,
@@ -108,11 +109,11 @@ def default_config() -> config_dict.ConfigDict:
                 base_height=-0.1,
                 torques=-1.0e-4,
                 action_rate=-0.05,
-                alive=0.2,
-                stagnation=0.5,
+                alive=0.05,
+                stagnation=0.0,
                 roll_accumulated=0.0,    # Disable repeated reward for current total.
                 side_roll_penalty=-0.5,
-                tuck_pose=1.0,
+                tuck_pose=0.5,
                 # Shaping only after one full turn; also useful in phase 0.
                 landing=2.0,
             ),
@@ -180,18 +181,13 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         self._foot_linvel_sensor_adr = jp.array(foot_linvel_sensor_adr)
 
         qpos_noise_scale = np.zeros(self._actuators)
-        hip_ids = [
-            idx for idx, j in enumerate(constants.JOINTS_ORDER_NO_HEAD) if "_hip" in j
-        ]
-        knee_ids = [
-            idx for idx, j in enumerate(constants.JOINTS_ORDER_NO_HEAD) if "_knee" in j
-        ]
-        ankle_ids = [
-            idx for idx, j in enumerate(constants.JOINTS_ORDER_NO_HEAD) if "_ankle" in j
-        ]
-        qpos_noise_scale[hip_ids] = self._config.noise_config.scales.hip_pos
-        qpos_noise_scale[knee_ids] = self._config.noise_config.scales.knee_pos
-        qpos_noise_scale[ankle_ids] = self._config.noise_config.scales.ankle_pos
+        for i, joint_name in enumerate(self.actuator_names):
+            if "_hip_" in joint_name:
+                qpos_noise_scale[i] = self._config.noise_config.scales.hip_pos
+            elif "_knee" in joint_name:
+                qpos_noise_scale[i] = self._config.noise_config.scales.knee_pos
+            elif "_ankle" in joint_name:
+                qpos_noise_scale[i] = self._config.noise_config.scales.ankle_pos
         self._qpos_noise_scale = jp.array(qpos_noise_scale)
 
     # ------------------------------------------------------------------
@@ -238,6 +234,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         ctrl = self.get_actuator_joints_qpos(qpos)
         data = mjx_env.init(self.mjx_model, qpos=qpos, qvel=qvel, ctrl=ctrl)
+        initial_forward = data.site_xmat[self._site_id][:, 0]
 
         info = {
             "rng": rng,
@@ -260,6 +257,10 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "accumulated_roll": jp.array(0.0),
             "max_roll": jp.array(0.0),
             "roll_progress_delta": jp.array(0.0),
+            "roll_rate": jp.array(0.0),
+            "last_roll_angle": jp.array(0.0),
+            "roll_forward": initial_forward,
+            "stalled_steps": jp.array(0, dtype=jp.int32),
             "roll_success": jp.array(False),
             "roll_success_now": jp.array(0.0),
         }
@@ -336,13 +337,25 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         p_fz = p_f[..., -1]
         state.info["swing_peak"] = jp.maximum(state.info["swing_peak"], p_fz)
 
-        # Track signed forward-roll angle. Positive progress means rotation
-        # in the intended forward direction; reverse rotation reduces it.
-        gyro = self.get_gyro(data)
-        gravity = self.get_gravity(data)
+        # Integrate the actual body inclination instead of raw angular
+        # velocity. Small back-and-forth jitter then cancels out and cannot be
+        # mistaken for completing a full forward roll.
+        gravity = self._get_body_gravity(data)
+        up_world = data.site_xmat[self._site_id][:, 2]
+        roll_forward = state.info["roll_forward"]
+        roll_angle = jp.arctan2(
+            jp.dot(up_world, roll_forward),
+            jp.dot(up_world, jp.array([0.0, 0.0, 1.0])),
+        )
+        angle_delta = jp.arctan2(
+            jp.sin(roll_angle - state.info["last_roll_angle"]),
+            jp.cos(roll_angle - state.info["last_roll_angle"]),
+        )
+        state.info["last_roll_angle"] = roll_angle
+        state.info["roll_rate"] = FLIP_DIRECTION * angle_delta / self.dt
+
         old_roll = state.info["accumulated_roll"]
-        signed_roll_velocity = FLIP_DIRECTION * gyro[ROLL_AXIS]
-        roll_delta = signed_roll_velocity * self.dt
+        roll_delta = FLIP_DIRECTION * angle_delta
 
         # Keep up to two turns of angular bookkeeping so a policy can recover
         # its upright posture even if it overshoots the first revolution.
@@ -364,6 +377,12 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
 
         base_height_now = data.qpos[self._floating_base_qpos_addr + 2]
+        made_progress = (new_roll - old_roll) > 0.005
+        state.info["stalled_steps"] = jp.where(
+            (base_height_now < 0.09) & (~made_progress),
+            state.info["stalled_steps"] + 1,
+            0,
+        )
         upright_now = gravity[-1] < -0.7
         feet_touching_now = jp.any(contact)
         roll_complete_now = new_roll >= ROLL_SUCCESS_ANGLE
@@ -379,6 +398,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         obs = self._get_obs(data, state.info, contact)
         done = self._get_termination(data, state.info)
+        done = done | (state.info["roll_success_now"] > 0.5)
 
         rewards = self._get_reward(
             data, action, state.info, state.metrics, done, first_contact, contact
@@ -424,12 +444,17 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         nan_term = jp.isnan(data.qpos).any() | jp.isnan(data.qvel).any()
 
         if ROLL_PHASE == 0:
-            # Phase 0: do not terminate on orientation. Let it tumble.
-            return nan_term
+            # Give the policy room to fall and explore, but reset a fallen
+            # robot after it has become stationary instead of letting it farm
+            # a long episode by twitching on the ground.
+            settled = info["stalled_steps"] > 25
+            incomplete = (
+                info["accumulated_roll"] < ROLL_SUCCESS_ANGLE - 0.5
+            )
+            return nan_term | (settled & incomplete)
 
-        # In this frame, upright has gravity_z ~= -1 and upside-down ~= +1.
-        # Phase 1 uses this as a simple failure termination condition.
-        upside_down = self.get_gravity(data)[-1] > 0.5
+        # Body-frame gravity is -Z upright and +Z upside down.
+        upside_down = self._get_body_gravity(data)[-1] > 0.5
         return nan_term | upside_down
 
     # ------------------------------------------------------------------
@@ -506,6 +531,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             [
                 noisy_gyro,  # 3
                 noisy_accelerometer,  # 3
+                noisy_gravity,  # 3
                 noisy_joint_angles - self._default_actuator,  # 14
                 noisy_joint_vel * self._config.dof_vel_scale,  # 14
                 info["last_act"],  # 14
@@ -560,12 +586,13 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         del metrics, done, first_contact
 
         gyro = self.get_gyro(data)
-        gravity = self.get_gravity(data)
+        gravity = self._get_body_gravity(data)
         base_height = data.qpos[self._floating_base_qpos_addr + 2]
-        signed_roll_velocity = FLIP_DIRECTION * gyro[ROLL_AXIS]
+        signed_roll_velocity = info["roll_rate"]
 
-                # Actuator joint order:
-        # left_hip_pitch, left_knee, right_hip_pitch, right_knee
+        # Actuator joint order:
+        # left_hip_pitch, left_knee, right_hip_pitch, right_knee.
+        # action_scale must allow the home pose to reach these limits.
         tuck_target = jp.array([1.0, 1.5, -1.0, 1.5])
         joint_angles = self.get_actuator_joints_qpos(data.qpos)
         tuck_angles = joint_angles[jp.array([2, 3, 11, 12])]
@@ -607,12 +634,9 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # the policy camp at a partially completed pose.
             "roll_accumulated": jp.array(0.0),
             "side_roll_penalty": jp.abs(gyro[0]),
-            # Penalize lack of correctly-directed progress, not merely lack
-            # of absolute angular speed.
-            "stagnation": -jp.clip(
-                1.0 - jp.maximum(signed_roll_velocity, 0.0) / 0.5,
-                0.0, 1.0
-            ),
+            # Disabled: paying for angular speed while stationary on the
+            # ground rewards twitching.
+            "stagnation": jp.array(0.0),
             "tuck_pose": tuck_reward,
             "landing": upright_shaping,
             # Divide by dt because step() multiplies the summed reward by dt.
@@ -621,3 +645,7 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         }
 
         return ret
+
+    def _get_body_gravity(self, data: mjx.Data) -> jax.Array:
+        """Gravity direction in the IMU/body frame."""
+        return data.site_xmat[self._site_id].T @ jp.array([0.0, 0.0, -1.0])

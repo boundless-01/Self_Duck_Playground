@@ -1,0 +1,25 @@
+# Local runtime caches
+.tmp/
+**/.tmp/
+.jax_cache/
+.pytest_cache/
+.ruff_cache/
+*.ses
+
+# Python build/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Training and simulation logs
+checkpoints/
+logs/
+events.out.tfevents.*
+*.log
+MUJOCO_LOG.TXT
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

@@ -296,8 +296,8 @@
                   quat="0.707107 2.80428e-16 0.707107 5.82867e-16" mesh="head" material="head_material"/>
                         <!-- Collision geom for rolling / tumbling -->
                 <geom name="head_collision" type="sphere"
-                  pos="-0.13 0 0.06"
-                  size="0.05"
+                  pos="0.009 -0.008 0.001"
+                  size="0.052"
                   contype="4" conaffinity="1"  
                   rgba="0 1 0 0.3"/>
                 <!-- Part bulb -->

@@ -4,9 +4,8 @@ MuJoCo viewer / inference environment for the Open Duck Mini V2 "roll" task.
 
 Mirrors playground/open_duck_mini_v2/roll.py (the MJX training env).
 
-NOTE: the 52.onnx policy expects a 92-dim observation, i.e. the FULL
-14-actuator model (including the 4 head joints). We therefore use all 14
-actuators directly, matching roll.py's `self._actuators = self.mjx_model.nu`.
+The policy expects a 95-dim observation, i.e. the full 14-actuator model
+including the four head joints and the explicit body-frame gravity vector.
 """
 
 import argparse
@@ -40,7 +39,7 @@ class MjInferRoll(MJInferBase):
         # ------------------------------------------------------------------
         # Params (must match roll.py's default_config)
         # ------------------------------------------------------------------
-        self.action_scale = 0.25
+        self.action_scale = 1.8
         self.dof_vel_scale = 0.05
         self.max_motor_velocity = 5.24  # rad/s
 
@@ -52,6 +51,14 @@ class MjInferRoll(MJInferBase):
         # Policy
         # ------------------------------------------------------------------
         self.policy = OnnxInfer(onnx_model_path, awd=True)
+        policy_input_shape = self.policy.ort_session.get_inputs()[0].shape
+        if policy_input_shape[-1] != 95:
+            raise ValueError(
+                "This roll policy expects "
+                f"{policy_input_shape[-1]} observations, but the updated roll "
+                "environment uses 95. Retrain/export the policy before running "
+                "the viewer."
+            )
 
         # ------------------------------------------------------------------
         # State
@@ -67,11 +74,12 @@ class MjInferRoll(MJInferBase):
         self.max_roll = 0.0
 
     # ----------------------------------------------------------------------
-    # Observation  (mirrors roll.py::_get_obs "state" vector, 92 dims)
+    # Observation  (mirrors roll.py::_get_obs "state" vector, 95 dims)
     # ----------------------------------------------------------------------
     def get_obs(self, data) -> np.ndarray:
         gyro = self.get_gyro(data)                          # 3
         accelerometer = self.get_accelerometer(data)        # 3
+        gravity = self.get_gravity(data)                    # 3
 
         joint_angles = self.get_actuator_joints_qpos(data.qpos)  # 14
         joint_vel = self.get_actuator_joints_qvel(data.qvel)     # 14
@@ -81,6 +89,7 @@ class MjInferRoll(MJInferBase):
             [
                 gyro,                                          # 3
                 accelerometer,                                 # 3
+                gravity,                                       # 3
                 joint_angles - self.default_actuator,          # 14
                 joint_vel * self.dof_vel_scale,                # 14
                 self.last_action,                              # 14
@@ -91,7 +100,7 @@ class MjInferRoll(MJInferBase):
             ]
         ).astype(np.float32)
 
-        assert obs.shape == (92,), f"obs shape {obs.shape} != (92,)"
+        assert obs.shape == (95,), f"obs shape {obs.shape} != (95,)"
         return obs
 
     # ----------------------------------------------------------------------
@@ -104,9 +113,10 @@ class MjInferRoll(MJInferBase):
             print("reset roll bookkeeping")
 
     def get_gravity(self, data):
-        """直接从 imu site 的旋转矩阵算 z 轴，绕过传感器布局问题。"""
+        """Gravity direction expressed in the IMU/body frame."""
         imu_site_id = self.model.site("imu").id
-        return data.site_xmat[imu_site_id].reshape(3, 3)[:, 2]
+        rotation = data.site_xmat[imu_site_id].reshape(3, 3)
+        return rotation.T @ np.array([0.0, 0.0, -1.0])
     
     # ----------------------------------------------------------------------
     # Main loop

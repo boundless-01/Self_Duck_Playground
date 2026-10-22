@@ -93,7 +93,7 @@ class BaseRunner(ABC):
         if self.args.env == "roll":
             self.ppo_params.unlock()   # 解锁
             self.ppo_params.num_timesteps = self.num_timesteps
-            self.ppo_params.episode_length = 1250          # 与 roll.py 的 episode_length 一致
+            self.ppo_params.episode_length = self.env_config.episode_length
             self.ppo_params.num_envs = 4096               # 可按 GPU 显存调
             self.ppo_params.learning_rate = 3e-4
             self.ppo_params.entropy_cost = 1e-2           # 翻滚探索性强，熵可以大一点
