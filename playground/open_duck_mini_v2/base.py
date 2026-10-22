@@ -164,7 +164,9 @@ class OpenDuckMiniV2Env(mjx_env.MjxEnv):
         return addr
 
     def get_floating_base_qpos(self, data:jax.Array) -> jax.Array:
-        return data[self._floating_base_qpos_addr:self._floating_base_qvel_addr+7]
+        return data[
+            self._floating_base_qpos_addr : self._floating_base_qpos_addr + 7
+        ]
 
     def get_floating_base_qvel(self, data:jax.Array) -> jax.Array:
         return data[self._floating_base_qvel_addr:self._floating_base_qvel_addr+6]
@@ -227,8 +229,9 @@ class OpenDuckMiniV2Env(mjx_env.MjxEnv):
 
     def set_complete_qpos_from_joints(self, no_backlash_qpos: jax.Array, full_qpos: jax.Array) -> jax.Array:
         """In the case of backlash joints, we want to ignore them (remove them) but we still need to set the complete state incuding them"""
-        full_qpos.at[self.exclude_backlash_joints_addr()].set(no_backlash_qpos)
-        return jp.array(full_qpos)
+        return full_qpos.at[self.exclude_backlash_joints_addr()].set(
+            no_backlash_qpos
+        )
 
     # Sensor readings.
     def get_gravity(self, data: mjx.Data) -> jax.Array:

@@ -19,6 +19,7 @@ from orbax import checkpoint as ocp
 import jax
 
 from playground.common.export_onnx import export_onnx
+from playground.common.roll_wrapper import wrap_for_roll_training
 
 
 class BaseRunner(ABC):
@@ -97,8 +98,10 @@ class BaseRunner(ABC):
             self.ppo_params.num_envs = 4096               # 可按 GPU 显存调
             self.ppo_params.learning_rate = 3e-4
             self.ppo_params.entropy_cost = 1e-2           # 翻滚探索性强，熵可以大一点
-            self.ppo_params.discounting = 0.97
-            # 网络结构：翻滚观测 92 维、动作 14 维，和默认一致的话不用改
+            # 50 Hz control: 0.99 keeps completion reward useful across the
+            # one-second-plus jump-and-roll sequence.
+            self.ppo_params.discounting = 0.99
+            # 网络结构：翻滚观测 97 维、动作 14 维。
         else:
             # 走路 / 站立沿用原配置
             self.ppo_training_params["num_timesteps"] = self.num_timesteps
@@ -124,9 +127,14 @@ class BaseRunner(ABC):
             policy_params_fn=self.policy_params_fn,
             restore_checkpoint_path=self.restore_checkpoint_path,
         )
+        wrap_env_fn = (
+            wrap_for_roll_training
+            if self.args.env == "roll"
+            else wrapper.wrap_for_brax_training
+        )
 
         _, params, _ = train_fn(
             environment=self.env,
             eval_env=self.eval_env,
-            wrap_env_fn=wrapper.wrap_for_brax_training,
+            wrap_env_fn=wrap_env_fn,
         )

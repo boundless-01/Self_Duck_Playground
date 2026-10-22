@@ -96,3 +96,32 @@ Inspired from https://github.com/kscalelabs/mujoco_playground
 ```bash
 uv run playground/open_duck_mini_v2/runner.py --task flat_terrain_backlash --num_timesteps 300000000
 ```
+
+## Forward roll curriculum
+
+Phase 0 gives the robot an assisted forward angular impulse so it can learn a
+head-contact roll, tuck, and leg extension without jumping:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env roll \
+  --task flat_terrain_roll \
+  --roll_phase 0 \
+  --output_dir checkpoints_roll_phase0
+```
+
+Check `eval/episode_roll_completed` and
+`eval/episode_reward/roll_complete` before continuing. Phase 1 starts from rest,
+enables domain randomization, and refines landing:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py \
+  --env roll \
+  --task flat_terrain_roll \
+  --roll_phase 1 \
+  --restore_checkpoint_path <phase-0-checkpoint-directory> \
+  --output_dir checkpoints_roll_phase1
+```
+
+Export a phase-1 ONNX checkpoint before running
+`playground/open_duck_mini_v2/mujoco_infer_roll.py`.

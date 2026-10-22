@@ -35,6 +35,17 @@ def set_bend_pose():
     data.qpos[12] = NECK_PITCH
     data.qpos[13] = HEAD_PITCH
 
+    # Hold the displayed pose when simulation is resumed.
+    data.ctrl[:] = model.keyframe("home").ctrl
+    data.ctrl[2] = BEND_ANGLE       # left_hip_pitch
+    data.ctrl[3] = 0.0              # left_knee
+    data.ctrl[4] = ANKLE_COMP       # left_ankle
+    data.ctrl[5] = NECK_PITCH       # neck_pitch
+    data.ctrl[6] = HEAD_PITCH       # head_pitch
+    data.ctrl[11] = -BEND_ANGLE     # right_hip_pitch
+    data.ctrl[12] = 0.0             # right_knee
+    data.ctrl[13] = ANKLE_COMP      # right_ankle
+
     data.qvel[:] = 0
     mujoco.mj_forward(model, data)
 

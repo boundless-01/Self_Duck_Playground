@@ -22,9 +22,18 @@ class OpenDuckMiniV2Runner(BaseRunner):
         self.env_file = available_envs[args.env]
 
         self.env_config = self.env_file[0].default_config()
+        if args.env == "roll":
+            roll.ROLL_PHASE = args.roll_phase
         self.env = self.env_file[1](task=args.task)
         self.eval_env = self.env_file[1](task=args.task)
-        self.randomizer = randomize.domain_randomize
+        # Start the roll curriculum without domain randomization. Crossing the
+        # first full rotation is already the hard exploration problem; enable
+        # the corrected randomizer in phase 1 for robustness.
+        self.randomizer = (
+            None
+            if args.env == "roll" and roll.ROLL_PHASE == 0
+            else randomize.domain_randomize
+        )
         self.action_size = self.env.action_size
         self.obs_size = int(
             self.env.observation_size["state"][0]
@@ -45,6 +54,13 @@ def main() -> None:
     parser.add_argument("--num_timesteps", type=int, default=150000000)
     parser.add_argument("--env", type=str, default="joystick", help="env")
     parser.add_argument("--task", type=str, default="flat_terrain", help="Task to run")
+    parser.add_argument(
+        "--roll_phase",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Roll curriculum: 0=assisted flip, 1=from rest/landing.",
+    )
     parser.add_argument(
         "--restore_checkpoint_path",
         type=str,

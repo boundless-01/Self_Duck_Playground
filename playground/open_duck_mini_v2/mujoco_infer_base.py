@@ -104,6 +104,7 @@ class MJInferBase:
         self.linvel_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SENSOR, "local_linvel"
         )
+        self.linvel_addr = self.model.sensor_adr[self.linvel_id]
         self.linvel_dimensions = 3
 
         self.imu_site_id = mujoco.mj_name2id(
@@ -158,7 +159,9 @@ class MJInferBase:
         return addr
 
     def get_floating_base_qpos(self, data: np.ndarray) -> np.ndarray:
-        return data[self._floating_base_qpos_addr : self._floating_base_qvel_addr + 7]
+        return data[
+            self._floating_base_qpos_addr : self._floating_base_qpos_addr + 7
+        ]
 
     def get_floating_base_qvel(self, data: np.ndarray) -> np.ndarray:
         return data[self._floating_base_qvel_addr : self._floating_base_qvel_addr + 6]
@@ -233,8 +236,9 @@ class MJInferBase:
         return np.array(full_qpos)
 
     def get_sensor(self, data, name, dimensions):
-        i = self.model.sensor_name2id(name)
-        return data.sensordata[i : i + dimensions]
+        sensor_id = self.model.sensor_name2id(name)
+        start = self.model.sensor_adr[sensor_id]
+        return data.sensordata[start : start + dimensions]
 
     def get_gyro(self, data):
         return data.sensordata[self.gyro_addr : self.gyro_addr + self.gyro_dimensions]
@@ -246,7 +250,9 @@ class MJInferBase:
         ]
 
     def get_linvel(self, data):
-        return data.sensordata[self.linvel_id : self.linvel_id + self.linvel_dimensions]
+        return data.sensordata[
+            self.linvel_addr : self.linvel_addr + self.linvel_dimensions
+        ]
 
     # def get_gravity(self, data):
     #     return data.site_xmat[self.imu_site_id].reshape((3, 3)).T @ np.array([0, 0, -1])

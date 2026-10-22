@@ -4,8 +4,8 @@ MuJoCo viewer / inference environment for the Open Duck Mini V2 "roll" task.
 
 Mirrors playground/open_duck_mini_v2/roll.py (the MJX training env).
 
-The policy expects a 95-dim observation, i.e. the full 14-actuator model
-including the four head joints and the explicit body-frame gravity vector.
+The policy expects a 99-dim observation: 95 proprioceptive values plus roll
+phase, episode time, and head/back ground contact.
 """
 
 import argparse
@@ -18,6 +18,7 @@ import mujoco.viewer
 
 from playground.common.onnx_infer import OnnxInfer
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
+from playground.open_duck_mini_v2.roll import default_config as roll_default_config
 
 
 USE_MOTOR_SPEED_LIMITS = True
@@ -33,31 +34,55 @@ class MjInferRoll(MJInferBase):
         self,
         model_path: str,
         onnx_model_path: str,
+        roll_phase: int = 0,
     ):
         super().__init__(model_path)
 
         # ------------------------------------------------------------------
         # Params (must match roll.py's default_config)
         # ------------------------------------------------------------------
-        self.action_scale = 1.8
-        self.dof_vel_scale = 0.05
-        self.max_motor_velocity = 5.24  # rad/s
+        roll_config = roll_default_config()
+        self.action_scale = roll_config.action_scale
+        self.dof_vel_scale = roll_config.dof_vel_scale
+        self.max_motor_velocity = roll_config.max_motor_velocity
+        self.control_dt = roll_config.ctrl_dt
+        self.episode_length = roll_config.episode_length
+        self.decimation = int(round(self.control_dt / self.sim_dt))
+        self.obs_size = 99
+        self.roll_phase = roll_phase
+        controlled_joints = {
+            "left_hip_pitch",
+            "left_knee",
+            "left_ankle",
+            "right_hip_pitch",
+            "right_knee",
+            "right_ankle",
+            "neck_pitch",
+            "head_pitch",
+        }
+        self.action_mask = np.array(
+            [name in controlled_joints for name in self.actuator_names],
+            dtype=bool,
+        )
 
         # 14 actuators (including head)
         self.num_dofs = self.model.nu  # 14
-        print(f"[roll] using {self.num_dofs} actuators: {self.actuator_names}")
+        print(
+            f"[roll] phase={self.roll_phase}, "
+            f"using {self.num_dofs} actuators: {self.actuator_names}"
+        )
 
         # ------------------------------------------------------------------
         # Policy
         # ------------------------------------------------------------------
         self.policy = OnnxInfer(onnx_model_path, awd=True)
         policy_input_shape = self.policy.ort_session.get_inputs()[0].shape
-        if policy_input_shape[-1] != 95:
+        if policy_input_shape[-1] != self.obs_size:
             raise ValueError(
                 "This roll policy expects "
                 f"{policy_input_shape[-1]} observations, but the updated roll "
-                "environment uses 95. Retrain/export the policy before running "
-                "the viewer."
+                f"environment uses {self.obs_size}. Retrain/export the policy "
+                "before running the viewer."
             )
 
         # ------------------------------------------------------------------
@@ -71,10 +96,35 @@ class MjInferRoll(MJInferBase):
         self.prev_motor_targets = np.asarray(self.default_actuator).copy()
 
         self.saved_obs = []
+        self.reset_episode()
+
+    def reset_episode(self):
+        """Reset simulation and all policy history to the training start."""
+        mujoco.mj_resetData(self.model, self.data)
+        self.data.qpos[:] = self.model.keyframe("home").qpos
+        self.data.qvel[:] = 0
+        if self.roll_phase == 0:
+            self.data.qvel[2] = 0.0
+            self.data.qvel[4] = 3.0
+        self.data.ctrl[:] = self.default_actuator
+        mujoco.mj_forward(self.model, self.data)
+
+        self.last_action[:] = 0.0
+        self.last_last_action[:] = 0.0
+        self.last_last_last_action[:] = 0.0
+        self.motor_targets[:] = self.default_actuator
+        self.prev_motor_targets[:] = self.default_actuator
         self.max_roll = 0.0
+        imu_site_id = self.model.site("imu").id
+        self.initial_forward = self.data.site_xmat[imu_site_id].reshape(3, 3)[:, 0]
+        self.last_roll_angle = 0.0
+        self.accumulated_roll = 0.0
+        self.control_step = 0
+        self.head_contacted = False
+        self.back_contacted = False
 
     # ----------------------------------------------------------------------
-    # Observation  (mirrors roll.py::_get_obs "state" vector, 95 dims)
+    # Observation  (mirrors roll.py::_get_obs "state" vector, 99 dims)
     # ----------------------------------------------------------------------
     def get_obs(self, data) -> np.ndarray:
         gyro = self.get_gyro(data)                          # 3
@@ -84,6 +134,10 @@ class MjInferRoll(MJInferBase):
         joint_angles = self.get_actuator_joints_qpos(data.qpos)  # 14
         joint_vel = self.get_actuator_joints_qvel(data.qvel)     # 14
         contacts = np.asarray(self.get_feet_contacts(data), dtype=np.float32)  # 2
+        head_contact = np.float32(self.check_contact(data, "head_assembly", "floor"))
+        self.head_contacted = self.head_contacted or bool(head_contact)
+        back_contact = np.float32(self.check_contact(data, "trunk_assembly", "floor"))
+        self.back_contacted = self.back_contacted or bool(back_contact)
 
         obs = np.concatenate(
             [
@@ -97,10 +151,22 @@ class MjInferRoll(MJInferBase):
                 self.last_last_last_action,                    # 14
                 self.motor_targets,                            # 14
                 contacts,                                      # 2
+                np.array(
+                    [min(self.accumulated_roll / (2.0 * np.pi), 2.0)],
+                    dtype=np.float32,
+                ),                                             # 1
+                np.array(
+                    [min(self.control_step / self.episode_length, 1.0)],
+                    dtype=np.float32,
+                ),                                             # 1
+                np.array([head_contact], dtype=np.float32),     # 1
+                np.array([back_contact], dtype=np.float32),     # 1
             ]
         ).astype(np.float32)
 
-        assert obs.shape == (95,), f"obs shape {obs.shape} != (95,)"
+        assert obs.shape == (self.obs_size,), (
+            f"obs shape {obs.shape} != ({self.obs_size},)"
+        )
         return obs
 
     # ----------------------------------------------------------------------
@@ -108,8 +174,8 @@ class MjInferRoll(MJInferBase):
     # ----------------------------------------------------------------------
     def key_callback(self, keycode):
         print(f"key: {keycode}")
-        if keycode == 82:  # r : reset roll bookkeeping
-            self.max_roll = 0.0
+        if keycode == 82:  # r : reset the episode
+            self.reset_episode()
             print("reset roll bookkeeping")
 
     def get_gravity(self, data):
@@ -117,6 +183,22 @@ class MjInferRoll(MJInferBase):
         imu_site_id = self.model.site("imu").id
         rotation = data.site_xmat[imu_site_id].reshape(3, 3)
         return rotation.T @ np.array([0.0, 0.0, -1.0])
+
+    def update_roll_progress(self, data) -> float:
+        """Update the unwrapped forward inclination and return its fraction."""
+        imu_site_id = self.model.site("imu").id
+        up_world = data.site_xmat[imu_site_id].reshape(3, 3)[:, 2]
+        roll_angle = np.arctan2(
+            np.dot(up_world, self.initial_forward),
+            up_world[2],
+        )
+        angle_delta = np.arctan2(
+            np.sin(roll_angle - self.last_roll_angle),
+            np.cos(roll_angle - self.last_roll_angle),
+        )
+        self.last_roll_angle = roll_angle
+        self.accumulated_roll = max(self.accumulated_roll + angle_delta, 0.0)
+        return self.accumulated_roll / (2.0 * np.pi)
     
     # ----------------------------------------------------------------------
     # Main loop
@@ -133,11 +215,10 @@ class MjInferRoll(MJInferBase):
                 counter = 0
                 while True:
                     step_start = time.time()
-
-                    mujoco.mj_step(self.model, self.data)
-                    counter += 1
-
                     if counter % self.decimation == 0:
+                        if self.control_step >= self.episode_length:
+                            self.reset_episode()
+                        roll_progress = self.update_roll_progress(self.data)
                         obs = self.get_obs(self.data)
                         self.saved_obs.append(obs)
 
@@ -145,11 +226,13 @@ class MjInferRoll(MJInferBase):
                             self.num_dofs
                         )
 
+                        if roll_progress > self.max_roll:
+                            self.max_roll = roll_progress
+
                         if counter % (self.decimation * 50) == 0:
                             gravity = self.get_gravity(self.data)
                             gyro = self.get_gyro(self.data)
                             qpos_base = self.data.qpos[:3]
-                            roll_progress = abs(float(gravity[ROLL_AXIS]))
 
                             floor_gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
                             ncon = self.data.ncon
@@ -164,7 +247,7 @@ class MjInferRoll(MJInferBase):
                                 f"base_z={qpos_base[2]:+.3f} "
                                 f"gravity={np.round(gravity, 2)} "
                                 f"gyro={np.round(gyro, 2)} "
-                                f"roll_prog={roll_progress:.2f} "
+                                f"roll_angle={np.degrees(self.accumulated_roll):.0f}deg "
                                 f"max_roll={self.max_roll:.2f} "
                                 f"ncon={ncon} floor_con={floor_contacts} "
                                 f"|act|={np.linalg.norm(action):.2f}"
@@ -204,9 +287,22 @@ class MjInferRoll(MJInferBase):
                         self.motor_targets = (
                             self.default_actuator + action * self.action_scale
                         )
+                        self.motor_targets = np.where(
+                            self.action_mask,
+                            self.motor_targets,
+                            self.default_actuator,
+                        )
+                        neck_i = self.actuator_names.index("neck_pitch")
+                        head_i = self.actuator_names.index("head_pitch")
+                        self.motor_targets[neck_i] = np.clip(
+                            self.motor_targets[neck_i], -0.349, 0.0
+                        )
+                        self.motor_targets[head_i] = np.clip(
+                            self.motor_targets[head_i], -0.785, 0.0
+                        )
 
                         if USE_MOTOR_SPEED_LIMITS:
-                            dt = self.sim_dt * self.decimation
+                            dt = self.control_dt
                             self.motor_targets = np.clip(
                                 self.motor_targets,
                                 self.prev_motor_targets - self.max_motor_velocity * dt,
@@ -215,13 +311,10 @@ class MjInferRoll(MJInferBase):
                             self.prev_motor_targets = self.motor_targets.copy()
 
                         self.data.ctrl[:] = self.motor_targets
+                        self.control_step += 1
 
-                        # ---- Debug: roll progress ------------------------
-                        gravity = self.get_gravity(self.data)
-                        roll_progress = abs(float(gravity[ROLL_AXIS]))
-                        if roll_progress > self.max_roll:
-                            self.max_roll = roll_progress
-
+                    mujoco.mj_step(self.model, self.data)
+                    counter += 1
                     viewer.sync()
 
                     time_until_next_step = self.model.opt.timestep - (
@@ -245,8 +338,19 @@ if __name__ == "__main__":
         type=str,
         default="playground/open_duck_mini_v2/xmls/scene_flat_terrain_roll.xml",
     )
+    parser.add_argument(
+        "--roll_phase",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Use 0 for assisted phase-0 checkpoints; 1 for from-rest models.",
+    )
 
     args = parser.parse_args()
 
-    mjinfer = MjInferRoll(args.model_path, args.onnx_model_path)
+    mjinfer = MjInferRoll(
+        args.model_path,
+        args.onnx_model_path,
+        roll_phase=args.roll_phase,
+    )
     mjinfer.run()

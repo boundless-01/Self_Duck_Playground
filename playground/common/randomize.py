@@ -19,11 +19,25 @@ import jax
 from mujoco import mjx
 import jax.numpy as jp
 
-FLOOR_GEOM_ID = 0
-TORSO_BODY_ID = 1
+FLOOR_GEOM_NAME = "floor"
+TORSO_BODY_NAME = "trunk_assembly"
+
+
+def _name_to_id(model: mjx.Model, name: str, adr_field: str) -> int:
+    """Resolve a MuJoCo object name without relying on model ordering."""
+    names = bytes(model.names)
+    for obj_id, start in enumerate(getattr(model, adr_field)):
+        end = names.find(b"\0", start)
+        if end < 0:
+            end = len(names)
+        if names[start:end].decode("utf-8") == name:
+            return obj_id
+    raise ValueError(f"Object {name!r} not found in mjx model")
 
 
 def domain_randomize(model: mjx.Model, rng: jax.Array):
+    floor_geom_id = _name_to_id(model, FLOOR_GEOM_NAME, "name_geomadr")
+    torso_body_id = _name_to_id(model, TORSO_BODY_NAME, "name_bodyadr")
 
     # _dof_addr=jp.array([6,8,10,12,14,16,18,20,22,24])
     # _joint_addr=jp.array([7,9,11,13,15,17,19,21,23,25])
@@ -40,7 +54,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
     def rand_dynamics(rng):
         # Floor friction: =U(0.4, 1.0).
         rng, key = jax.random.split(rng)
-        geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(
+        geom_friction = model.geom_friction.at[floor_geom_id, 0].set(
             jax.random.uniform(key, minval=0.5, maxval=1.0)  # was 0.4, 1.0
         )
 
@@ -58,22 +72,29 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
         )
         dof_armature = model.dof_armature.at[dof_addr].set(armature)
 
-        # Jitter center of mass positiion: +U(-0.05, 0.05).
+        # Jitter center of mass position by at most 2 cm.
         rng, key = jax.random.split(rng)
-        dpos = jax.random.uniform(key, (3,), minval=-0.05, maxval=0.05)
-        body_ipos = model.body_ipos.at[TORSO_BODY_ID].set(
-            model.body_ipos[TORSO_BODY_ID] + dpos
+        dpos = jax.random.uniform(key, (3,), minval=-0.02, maxval=0.02)
+        body_ipos = model.body_ipos.at[torso_body_id].set(
+            model.body_ipos[torso_body_id] + dpos
         )
 
-        # Scale all link masses: *U(0.9, 1.1).
+        # Scale all link masses and inertias together.
         rng, key = jax.random.split(rng)
-        dmass = jax.random.uniform(key, shape=(model.nbody,), minval=0.9, maxval=1.1)
+        dmass = jax.random.uniform(
+            key, shape=(model.nbody,), minval=0.95, maxval=1.05
+        )
         body_mass = model.body_mass.at[:].set(model.body_mass * dmass)
+        body_inertia = model.body_inertia.at[:].set(
+            model.body_inertia * dmass[:, None]
+        )
 
-        # Add mass to torso: +U(-0.2, 0.2).
+        # Add mass to the trunk: +U(-0.05, 0.05).
         rng, key = jax.random.split(rng)
-        dmass = jax.random.uniform(key, minval=-0.1, maxval=0.1)  # was -0.2, 0.2
-        body_mass = body_mass.at[TORSO_BODY_ID].set(body_mass[TORSO_BODY_ID] + dmass)
+        dmass = jax.random.uniform(key, minval=-0.05, maxval=0.05)
+        body_mass = body_mass.at[torso_body_id].set(
+            body_mass[torso_body_id] + dmass
+        )
 
         # Jitter qpos0: +U(-0.05, 0.05).
         rng, key = jax.random.split(rng)
@@ -100,6 +121,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
             dof_frictionloss,
             dof_armature,
             body_mass,
+            body_inertia,
             qpos0,
             actuator_gainprm,
             actuator_biasprm,
@@ -111,6 +133,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
         frictionloss,
         armature,
         body_mass,
+        body_inertia,
         qpos0,
         actuator_gainprm,
         actuator_biasprm,
@@ -124,6 +147,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
             "dof_frictionloss": 0,
             "dof_armature": 0,
             "body_mass": 0,
+            "body_inertia": 0,
             "qpos0": 0,
             "actuator_gainprm": 0,
             "actuator_biasprm": 0,
@@ -137,6 +161,7 @@ def domain_randomize(model: mjx.Model, rng: jax.Array):
             "dof_frictionloss": frictionloss,
             "dof_armature": armature,
             "body_mass": body_mass,
+            "body_inertia": body_inertia,
             "qpos0": qpos0,
             "actuator_gainprm": actuator_gainprm,
             "actuator_biasprm": actuator_biasprm,

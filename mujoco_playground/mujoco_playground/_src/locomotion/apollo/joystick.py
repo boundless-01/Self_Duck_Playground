@@ -199,7 +199,7 @@ class Joystick(base.ApolloEnv):
 
   def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
     state = self.apply_push(state)
-    motor_targets = self._default_ctrl + action * self._config.action_scale
+     self._default_ctrl + action * self._config.action_scale
     data = mjx_env.step(
         self.mjx_model, state.data, motor_targets, self.n_substeps
     )
