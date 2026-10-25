@@ -18,7 +18,10 @@ import mujoco.viewer
 
 from playground.common.onnx_infer import OnnxInfer
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
-from playground.open_duck_mini_v2.roll import default_config as roll_default_config
+from playground.open_duck_mini_v2.roll import (
+    FLIP_DIRECTION,
+    default_config as roll_default_config,
+)
 
 
 USE_MOTOR_SPEED_LIMITS = True
@@ -33,8 +36,9 @@ class MjInferRoll(MJInferBase):
     def __init__(
         self,
         model_path: str,
-        onnx_model_path: str,
+        onnx_model_path: str | None,
         roll_phase: int = 0,
+        scripted_only: bool = False,
     ):
         super().__init__(model_path)
 
@@ -43,13 +47,36 @@ class MjInferRoll(MJInferBase):
         # ------------------------------------------------------------------
         roll_config = roll_default_config()
         self.action_scale = roll_config.action_scale
+        self.pre_head_action_scale = roll_config.pre_head_action_scale
         self.dof_vel_scale = roll_config.dof_vel_scale
         self.max_motor_velocity = roll_config.max_motor_velocity
         self.control_dt = roll_config.ctrl_dt
         self.episode_length = roll_config.episode_length
+        self.head_pitch_lower = np.array(
+            [
+                self.model.jnt_range[
+                    self.actuator_joint_dict["neck_pitch"]
+                ][0],
+                self.model.jnt_range[
+                    self.actuator_joint_dict["head_pitch"]
+                ][0],
+            ]
+        )
+        self.release_com_tolerance = (
+            roll_config.reward_config.head_release_com_tolerance
+        )
+        self.release_up_z = roll_config.reward_config.head_release_up_z
+        self.release_knee = roll_config.reward_config.head_release_knee
+        self.heel_support_steps = roll_config.reward_config.heel_support_steps
+        self.recovery_roll_fraction = (
+            roll_config.reward_config.recovery_roll_fraction
+        )
+        self.deep_fold_neck = roll_config.reward_config.deep_fold_neck
+        self.deep_fold_head = roll_config.reward_config.deep_fold_head
         self.decimation = int(round(self.control_dt / self.sim_dt))
         self.obs_size = 99
         self.roll_phase = roll_phase
+        self.scripted_only = scripted_only
         controlled_joints = {
             "left_hip_pitch",
             "left_knee",
@@ -60,10 +87,48 @@ class MjInferRoll(MJInferBase):
             "neck_pitch",
             "head_pitch",
         }
-        self.action_mask = np.array(
+        self.roll_action_mask = np.array(
             [name in controlled_joints for name in self.actuator_names],
             dtype=bool,
         )
+        recovery_joints = controlled_joints | {
+            "left_hip_roll",
+            "right_hip_roll",
+            "left_hip_yaw",
+            "right_hip_yaw",
+        }
+        self.recovery_action_mask = np.array(
+            [name in recovery_joints for name in self.actuator_names],
+            dtype=bool,
+        )
+        self.launch_crouch_duration = 0.10
+        self.launch_push_end = 0.30
+        self.launch_crouch_targets = np.asarray(self.default_actuator).copy()
+        self.launch_crouch_targets[
+            [self.actuator_names.index("left_hip_pitch"),
+             self.actuator_names.index("right_hip_pitch")]
+        ] = [1.20, -1.20]
+        self.launch_crouch_targets[
+            [self.actuator_names.index("left_knee"),
+             self.actuator_names.index("right_knee")]
+        ] = [0.80, 0.80]
+        self.launch_crouch_targets[
+            [self.actuator_names.index("left_ankle"),
+             self.actuator_names.index("right_ankle")]
+        ] = [0.0, 0.0]
+        self.launch_push_targets = np.asarray(self.default_actuator).copy()
+        self.launch_push_targets[
+            [self.actuator_names.index("left_hip_pitch"),
+             self.actuator_names.index("right_hip_pitch")]
+        ] = [1.20, -1.20]
+        self.launch_push_targets[
+            [self.actuator_names.index("left_knee"),
+             self.actuator_names.index("right_knee")]
+        ] = [0.0, 0.0]
+        self.launch_push_targets[
+            [self.actuator_names.index("left_ankle"),
+             self.actuator_names.index("right_ankle")]
+        ] = [-1.20, -1.20]
 
         # 14 actuators (including head)
         self.num_dofs = self.model.nu  # 14
@@ -75,15 +140,19 @@ class MjInferRoll(MJInferBase):
         # ------------------------------------------------------------------
         # Policy
         # ------------------------------------------------------------------
-        self.policy = OnnxInfer(onnx_model_path, awd=True)
-        policy_input_shape = self.policy.ort_session.get_inputs()[0].shape
-        if policy_input_shape[-1] != self.obs_size:
-            raise ValueError(
-                "This roll policy expects "
-                f"{policy_input_shape[-1]} observations, but the updated roll "
-                f"environment uses {self.obs_size}. Retrain/export the policy "
-                "before running the viewer."
-            )
+        self.policy = None
+        if not self.scripted_only:
+            if onnx_model_path is None:
+                raise ValueError("--onnx_model_path is required unless using --scripted_only")
+            self.policy = OnnxInfer(onnx_model_path, awd=True)
+            policy_input_shape = self.policy.ort_session.get_inputs()[0].shape
+            if policy_input_shape[-1] != self.obs_size:
+                raise ValueError(
+                    "This roll policy expects "
+                    f"{policy_input_shape[-1]} observations, but the updated roll "
+                    f"environment uses {self.obs_size}. Retrain/export the policy "
+                    "before running the viewer."
+                )
 
         # ------------------------------------------------------------------
         # State
@@ -104,8 +173,8 @@ class MjInferRoll(MJInferBase):
         self.data.qpos[:] = self.model.keyframe("home").qpos
         self.data.qvel[:] = 0
         if self.roll_phase == 0:
-            self.data.qvel[2] = 0.0
-            self.data.qvel[4] = 3.0
+            self.data.qvel[2] = 1.5
+            self.data.qvel[4] = 8.0
         self.data.ctrl[:] = self.default_actuator
         mujoco.mj_forward(self.model, self.data)
 
@@ -116,12 +185,29 @@ class MjInferRoll(MJInferBase):
         self.prev_motor_targets[:] = self.default_actuator
         self.max_roll = 0.0
         imu_site_id = self.model.site("imu").id
-        self.initial_forward = self.data.site_xmat[imu_site_id].reshape(3, 3)[:, 0]
+        # site_xmat is a view into MjData. Copy it at reset, otherwise the
+        # "initial" forward direction rotates with the robot and both roll
+        # progress and the COM/head test become meaningless.
+        self.initial_forward = np.array(
+            self.data.site_xmat[imu_site_id].reshape(3, 3)[:, 0],
+            copy=True,
+        )
+        self.forward_xy = self.initial_forward.copy()
+        self.forward_xy[2] = 0.0
+        self.forward_xy /= max(np.linalg.norm(self.forward_xy), 1e-6)
         self.last_roll_angle = 0.0
         self.accumulated_roll = 0.0
         self.control_step = 0
         self.head_contacted = False
+        self.head_contact_steps = 0
+        self.release_ready = False
+        self.knees_popped = False
+        self.hips_released = False
+        self.inverted = False
+        self.recovery_ready = False
         self.back_contacted = False
+        self.heel_contact_steps = 0
+        self.heel_planted = False
 
     # ----------------------------------------------------------------------
     # Observation  (mirrors roll.py::_get_obs "state" vector, 99 dims)
@@ -134,8 +220,89 @@ class MjInferRoll(MJInferBase):
         joint_angles = self.get_actuator_joints_qpos(data.qpos)  # 14
         joint_vel = self.get_actuator_joints_qvel(data.qvel)     # 14
         contacts = np.asarray(self.get_feet_contacts(data), dtype=np.float32)  # 2
+        self.current_contacts = contacts
         head_contact = np.float32(self.check_contact(data, "head_assembly", "floor"))
-        self.head_contacted = self.head_contacted or bool(head_contact)
+        q = joint_angles
+        neck_i = self.actuator_names.index("neck_pitch")
+        head_i = self.actuator_names.index("head_pitch")
+        left_hip_i = self.actuator_names.index("left_hip_pitch")
+        right_hip_i = self.actuator_names.index("right_hip_pitch")
+        left_knee_i = self.actuator_names.index("left_knee")
+        right_knee_i = self.actuator_names.index("right_knee")
+        was_head_contacted = self.head_contacted
+        was_release_ready = self.release_ready
+        was_knees_popped = self.knees_popped
+        was_hips_released = self.hips_released
+        deep_fold = (
+            q[neck_i] <= self.deep_fold_neck
+            and q[head_i] <= self.deep_fold_head
+            and q[left_hip_i] >= 0.60
+            and q[right_hip_i] <= -0.60
+        )
+        deep_head_contact = bool(head_contact) and deep_fold
+        if deep_head_contact:
+            self.head_contact_steps += 1
+        self.head_contacted = self.head_contacted or deep_head_contact
+        head_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "head_collision"
+        )
+        trunk_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "trunk_assembly"
+        )
+        com_offset = data.subtree_com[trunk_body_id] - data.geom_xpos[head_geom_id]
+        com_offset[2] = 0.0
+        com_forward_of_head = float(np.dot(com_offset, self.forward_xy))
+        imu_site_id = self.model.site("imu").id
+        up_z = float(data.site_xmat[imu_site_id].reshape(3, 3)[2, 2])
+        release_ready_now = self.head_contacted and (
+            com_forward_of_head >= self.release_com_tolerance
+            and up_z <= self.release_up_z
+            and q[left_knee_i] >= self.release_knee
+            and q[right_knee_i] >= self.release_knee
+        )
+        self.release_ready = self.release_ready or release_ready_now
+        if (
+            self.release_ready
+            and q[left_knee_i] <= 0.2
+            and q[right_knee_i] <= 0.2
+        ):
+            self.knees_popped = True
+        if (
+            self.knees_popped
+            and abs(q[left_hip_i]) <= 0.2
+            and abs(q[right_hip_i]) <= 0.2
+        ):
+            self.hips_released = True
+        heel_support_now = (
+            self.hips_released
+            and self.back_contacted
+            and bool(np.any(contacts))
+        )
+        self.heel_contact_steps = (
+            min(self.heel_contact_steps + 1, 100)
+            if heel_support_now
+            else 0
+        )
+        if self.heel_contact_steps >= self.heel_support_steps:
+            self.heel_planted = True
+        if self.head_contacted and not was_head_contacted:
+            print(
+                f"[roll event] head contact t={self.control_step * self.control_dt:.2f}s "
+                f"COM-head={com_forward_of_head:+.3f}m"
+            )
+        if self.release_ready and not was_release_ready:
+            print(
+                f"[roll event] release t={self.control_step * self.control_dt:.2f}s "
+                f"COM-head={com_forward_of_head:+.3f}m up_z={up_z:+.3f}"
+            )
+        if self.knees_popped and not was_knees_popped:
+            print(
+                f"[roll event] knees extended t={self.control_step * self.control_dt:.2f}s"
+            )
+        if self.hips_released and not was_hips_released:
+            print(
+                f"[roll event] hips released t={self.control_step * self.control_dt:.2f}s"
+            )
         back_contact = np.float32(self.check_contact(data, "trunk_assembly", "floor"))
         self.back_contacted = self.back_contacted or bool(back_contact)
 
@@ -197,7 +364,22 @@ class MjInferRoll(MJInferBase):
             np.cos(roll_angle - self.last_roll_angle),
         )
         self.last_roll_angle = roll_angle
-        self.accumulated_roll = max(self.accumulated_roll + angle_delta, 0.0)
+        self.accumulated_roll = max(
+            self.accumulated_roll + FLIP_DIRECTION * angle_delta, 0.0
+        )
+        if self.accumulated_roll >= self.recovery_roll_fraction * 2.0 * np.pi:
+            if not self.recovery_ready:
+                print(
+                    f"[roll event] recovery enabled t="
+                    f"{self.control_step * self.control_dt:.2f}s"
+                )
+            self.recovery_ready = True
+        if self.head_contacted and self.release_ready and up_world[2] < -0.5:
+            if not self.inverted:
+                print(
+                    f"[roll event] inverted t={self.control_step * self.control_dt:.2f}s"
+                )
+            self.inverted = True
         return self.accumulated_roll / (2.0 * np.pi)
     
     # ----------------------------------------------------------------------
@@ -222,9 +404,12 @@ class MjInferRoll(MJInferBase):
                         obs = self.get_obs(self.data)
                         self.saved_obs.append(obs)
 
-                        action = np.asarray(self.policy.infer(obs)).reshape(
-                            self.num_dofs
-                        )
+                        if self.scripted_only:
+                            action = np.zeros(self.num_dofs, dtype=np.float32)
+                        else:
+                            action = np.asarray(self.policy.infer(obs)).reshape(
+                                self.num_dofs
+                            )
 
                         if roll_progress > self.max_roll:
                             self.max_roll = roll_progress
@@ -284,21 +469,98 @@ class MjInferRoll(MJInferBase):
                         self.last_last_action = self.last_action.copy()
                         self.last_action = action.copy()
 
-                        self.motor_targets = (
-                            self.default_actuator + action * self.action_scale
+                        reference_targets = np.asarray(
+                            self.default_actuator
+                        ).copy()
+                        neck_i = self.actuator_names.index("neck_pitch")
+                        head_i = self.actuator_names.index("head_pitch")
+                        left_hip_i = self.actuator_names.index("left_hip_pitch")
+                        right_hip_i = self.actuator_names.index("right_hip_pitch")
+                        left_knee_i = self.actuator_names.index("left_knee")
+                        right_knee_i = self.actuator_names.index("right_knee")
+                        left_ankle_i = self.actuator_names.index("left_ankle")
+                        right_ankle_i = self.actuator_names.index("right_ankle")
+                        if self.recovery_ready:
+                            reference_targets = np.asarray(
+                                self.default_actuator
+                            ).copy()
+                            if not np.all(self.current_contacts):
+                                reference_targets[
+                                    [left_hip_i, right_hip_i, left_knee_i,
+                                     right_knee_i, left_ankle_i, right_ankle_i]
+                                ] = [-0.8, 0.8, 0.3, 0.3, 1.0, 1.0]
+                        elif not self.head_contacted:
+                            launch_time = self.control_step * self.control_dt
+                            if launch_time < self.launch_crouch_duration:
+                                reference_targets = self.launch_crouch_targets.copy()
+                            elif launch_time < self.launch_push_end:
+                                reference_targets = self.launch_push_targets.copy()
+                            else:
+                                reference_targets[
+                                    [neck_i, head_i, left_hip_i, right_hip_i,
+                                     left_knee_i, right_knee_i,
+                                     left_ankle_i, right_ankle_i]
+                                ] = [-0.349, -0.785, 1.22, -1.22,
+                                     1.50, 1.50, -1.20, -1.20]
+                        elif not self.release_ready:
+                            # Keep the compact tuck while the head is the pivot.
+                            reference_targets[
+                                [neck_i, head_i, left_hip_i, right_hip_i,
+                                 left_knee_i, right_knee_i,
+                                 left_ankle_i, right_ankle_i]
+                            ] = [-0.349, -0.785, 1.22, -1.22,
+                                 1.50, 1.50, -1.20, -1.20]
+                        elif not self.knees_popped:
+                            # Extend knees toward zero while holding the hip fold.
+                            reference_targets[
+                                [left_hip_i, right_hip_i, left_knee_i,
+                                 right_knee_i, left_ankle_i, right_ankle_i]
+                            ] = [1.22, -1.22, 0.0, 0.0, -1.2, -1.2]
+                        elif not self.hips_released:
+                            reference_targets[
+                                [left_hip_i, right_hip_i, left_knee_i,
+                                 right_knee_i, left_ankle_i, right_ankle_i]
+                            ] = [0.0, 0.0, 0.0, 0.0, -1.2, -1.2]
+                        elif not self.heel_planted:
+                            # Swing the legs back so the heels can find the floor.
+                            reference_targets[
+                                [left_hip_i, right_hip_i, left_knee_i,
+                                 right_knee_i, left_ankle_i, right_ankle_i]
+                            ] = [-0.80, 0.80, 0.30, 0.30, 1.0, 1.0]
+                        else:
+                            # Recover to the home stance after the heels support
+                            # the body.
+                            reference_targets = np.asarray(
+                                self.default_actuator
+                            ).copy()
+
+                        residual_scale = (
+                            self.action_scale
+                            if self.head_contacted
+                            else self.pre_head_action_scale
+                        )
+                        active_action_mask = (
+                            self.recovery_action_mask
+                            if self.recovery_ready
+                            else self.roll_action_mask
+                        )
+                        self.motor_targets = reference_targets + (
+                            action * residual_scale * active_action_mask
                         )
                         self.motor_targets = np.where(
-                            self.action_mask,
+                            active_action_mask,
                             self.motor_targets,
                             self.default_actuator,
                         )
-                        neck_i = self.actuator_names.index("neck_pitch")
-                        head_i = self.actuator_names.index("head_pitch")
                         self.motor_targets[neck_i] = np.clip(
-                            self.motor_targets[neck_i], -0.349, 0.0
+                            self.motor_targets[neck_i],
+                            self.head_pitch_lower[0],
+                            0.0,
                         )
                         self.motor_targets[head_i] = np.clip(
-                            self.motor_targets[head_i], -0.785, 0.0
+                            self.motor_targets[head_i],
+                            self.head_pitch_lower[1],
+                            0.0,
                         )
 
                         if USE_MOTOR_SPEED_LIMITS:
@@ -332,7 +594,7 @@ class MjInferRoll(MJInferBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-o", "--onnx_model_path", type=str, required=True)
+    parser.add_argument("-o", "--onnx_model_path", type=str)
     parser.add_argument(
         "--model_path",
         type=str,
@@ -345,6 +607,11 @@ if __name__ == "__main__":
         default=0,
         help="Use 0 for assisted phase-0 checkpoints; 1 for from-rest models.",
     )
+    parser.add_argument(
+        "--scripted_only",
+        action="store_true",
+        help="Run the phase reference without loading or applying an ONNX policy.",
+    )
 
     args = parser.parse_args()
 
@@ -352,5 +619,6 @@ if __name__ == "__main__":
         args.model_path,
         args.onnx_model_path,
         roll_phase=args.roll_phase,
+        scripted_only=args.scripted_only,
     )
     mjinfer.run()

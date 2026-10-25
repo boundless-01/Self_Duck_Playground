@@ -32,7 +32,7 @@
 
     <worldbody>
         <body name="floor">
-            <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="1" conaffinity="0"
+            <geom name="floor" size="0 0 0.01" type="plane" material="groundplane" contype="1" conaffinity="9"
                 priority="1" friction="0.6" condim="3"/>
         </body>
     </worldbody>

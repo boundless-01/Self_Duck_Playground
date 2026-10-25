@@ -55,7 +55,7 @@ ROLL_PHASE = 0
 # Which body axis to roll around. 0 = x (side roll), 1 = y (forward roll).
 ROLL_AXIS = 1
 # Right-handed robot frame: +X forward, +Y left, +Z up.
-# A positive rotation about +Y pitches the +X/front direction downward.
+# Rotate about +Y for a forward roll (the robot's front travels downward).
 FLIP_DIRECTION = 1.0
 ROLL_SUCCESS_ANGLE = 2.0 * np.pi
 
@@ -67,19 +67,21 @@ def default_config() -> config_dict.ConfigDict:
         # Contact transitions around the head are sensitive to a few ms.
         ctrl_dt=0.01,
         sim_dt=0.002,
-        # At 100 Hz this is still a 10 second episode.
-        episode_length=1000,
+        # At 100 Hz this is a 5 second episode.
+        episode_length=500,
         action_repeat=1,
-        # The policy output is bounded to [-1, 1]. A 0.25 scale only permits
-        # +/-0.25 rad around home and cannot reach the tuck pose.
-        action_scale=1.8,
+        # The scripted phase supplies the nominal tuck/launch pose. The policy
+        # output is a bounded residual around that reference, so it can correct
+        # timing and contact torque in every phase instead of being ignored.
+        action_scale=0.5,
+        pre_head_action_scale=0.1,
         dof_vel_scale=0.05,
         history_len=0,
         soft_joint_pos_limit_factor=0.95,
         max_motor_velocity=5.24,  # rad/s
         # Phase 0 bootstrap: forward contact roll without an upward jump.
-        initial_roll_speed_range=[3.0, 3.0001],
-        initial_vertical_speed_range=[0.0, 0.0001],
+        initial_roll_speed_range=[8.0, 8.0001],
+        initial_vertical_speed_range=[1.5, 1.5001],
         noise_config=config_dict.create(
             # Start without injected observation noise or delays. Re-enable
             # gradually after the basic roll is learned.
@@ -118,18 +120,41 @@ def default_config() -> config_dict.ConfigDict:
                 stagnation=0.0,
                 roll_accumulated=0.0,    # Disable repeated reward for current total.
                 side_roll_penalty=-0.5,
-                tuck_pose=0.5,
-                head_down=0.5,
-                recovery=0.5,
+                tuck_pose=1.0,
+                head_down=1.0,
+                hip_fold=1.0,
+                knee_pop=1.0,
+                hip_pop=1.0,
+                heel=1.0,
+                heel_plant=10.0,
+                recovery=5.0,
+                stand_height=2.0,
+                stable_stand=10.0,
+                foot_contact=2.0,
                 sitting=-3.0,
                 # Shaping only after one full turn; also useful in phase 0.
-                landing=2.0,
+                landing=5.0,
             ),
             roll_target_vel=6.0,
             roll_sigma=4.0,
             tuck_height=0.12,  # metres, crouched base height
-            tuck_release_start=2.6,  # rad of forward inclination
-            tuck_release_end=3.3,
+            deep_fold_neck=-0.25,
+            deep_fold_head=-0.60,
+            # Allow release once the COM projection has just reached the
+            # head support point; requiring an exact floating-point crossing
+            # makes the event unnecessarily brittle.
+            head_release_com_tolerance=0.005,
+            # Keep the compact tuck while the head acts as the pivot. Releasing
+            # at first touch is too early and pushes the body back upright.
+            head_release_up_z=0.0,
+            head_release_knee=0.60,
+            heel_support_steps=20,
+            stable_stand_steps=30,
+            # Recovery must not depend on a single scripted contact sequence.
+            # Once the robot has rolled to within roughly 60 degrees of upright,
+            # let the policy recover even if it reached that pose by a different
+            # contact path.
+            recovery_roll_fraction=0.50,
         ),
         push_config=config_dict.create(
             enable=False,
@@ -198,12 +223,39 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 self.actuator_names.index("head_pitch"),
             ]
         )
+        self._hip_pitch_indices = jp.array(
+            [
+                self.actuator_names.index("left_hip_pitch"),
+                self.actuator_names.index("right_hip_pitch"),
+            ]
+        )
+        self._ankle_indices = jp.array(
+            [
+                self.actuator_names.index("left_ankle"),
+                self.actuator_names.index("right_ankle"),
+            ]
+        )
+        self._knee_indices = jp.array(
+            [
+                self.actuator_names.index("left_knee"),
+                self.actuator_names.index("right_knee"),
+            ]
+        )
         active_joint_names = set(roll_joint_names) | {
             "neck_pitch",
             "head_pitch",
         }
         self._roll_action_mask = jp.array(
             [name in active_joint_names for name in self.actuator_names]
+        )
+        recovery_joint_names = active_joint_names | {
+            "left_hip_roll",
+            "right_hip_roll",
+            "left_hip_yaw",
+            "right_hip_yaw",
+        }
+        self._recovery_action_mask = jp.array(
+            [name in recovery_joint_names for name in self.actuator_names]
         )
         self._head_pitch_lower = jp.array(
             [
@@ -215,6 +267,48 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
                 ][0],
             ]
         )
+        self._pre_fold_head_targets = jp.array([-0.349, -0.785])
+        # The leg Pitch joints are mirrored: + on the left and - on the right
+        # folds both thighs in the same physical direction.
+        self._pre_fold_hip_targets = jp.array([1.22, -1.22])
+        self._pre_fold_knee_targets = jp.array([1.50, 1.50])
+        self._pre_fold_ankle_targets = jp.array([-1.20, -1.20])
+        # Load the feet, extend/lean while the feet still have traction, then
+        # fold the head and knees. This was selected in MuJoCo by requiring
+        # head contact to occur before trunk contact.
+        self._launch_crouch_duration = 0.10
+        self._launch_push_end = 0.30
+        self._launch_crouch_targets = jp.array(self._default_actuator)
+        self._launch_crouch_targets = self._launch_crouch_targets.at[
+            self._hip_pitch_indices
+        ].set([1.20, -1.20])
+        self._launch_crouch_targets = self._launch_crouch_targets.at[
+            self._knee_indices
+        ].set([0.80, 0.80])
+        self._launch_crouch_targets = self._launch_crouch_targets.at[
+            self._ankle_indices
+        ].set([0.0, 0.0])
+        self._launch_push_targets = jp.array(self._default_actuator)
+        self._launch_push_targets = self._launch_push_targets.at[
+            self._hip_pitch_indices
+        ].set([1.20, -1.20])
+        self._launch_push_targets = self._launch_push_targets.at[
+            self._knee_indices
+        ].set([0.0, 0.0])
+        self._launch_push_targets = self._launch_push_targets.at[
+            self._ankle_indices
+        ].set([-1.20, -1.20])
+        self._heel_targets = jp.array(self._default_actuator)
+        self._heel_targets = self._heel_targets.at[self._hip_pitch_indices].set(
+            [-0.80, 0.80]
+        )
+        self._heel_targets = self._heel_targets.at[self._knee_indices].set(
+            [0.30, 0.30]
+        )
+        self._heel_targets = self._heel_targets.at[self._ankle_indices].set(
+            [1.00, 1.00]
+        )
+        self._recovery_targets = jp.array(self._default_actuator)
 
         foot_linvel_sensor_adr = []
         for site in constants.FEET_SITES:
@@ -333,14 +427,27 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             "roll_forward": initial_forward,
             "stalled_steps": jp.array(0, dtype=jp.int32),
             "head_contact": jp.array(False),
+            "deep_fold": jp.array(False),
+            "hip_fold": jp.array(False),
             "head_contacted": jp.array(False),
             "head_contact_steps": jp.array(0, dtype=jp.int32),
+            "release_ready": jp.array(False),
+            "knees_popped": jp.array(False),
+            "hips_released": jp.array(False),
+            "inverted": jp.array(False),
             "back_contact": jp.array(False),
             "back_contacted": jp.array(False),
+            "heel_support": jp.array(False),
+            "heel_contact_steps": jp.array(0, dtype=jp.int32),
+            "heel_planted": jp.array(False),
+            "heel_plant_now": jp.array(0.0),
+            "recovery_ready": jp.array(False),
             "roll_completed": jp.array(False),
             "roll_complete_now": jp.array(0.0),
             "roll_success": jp.array(False),
             "roll_success_now": jp.array(0.0),
+            "stand_steps": jp.array(0, dtype=jp.int32),
+            "stand_stable": jp.array(False),
         }
 
         metrics = {}
@@ -357,7 +464,16 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         metrics["roll_completed"] = jp.zeros(())
         metrics["roll_success"] = jp.zeros(())
         metrics["head_contact"] = jp.zeros(())
+        metrics["deep_fold"] = jp.zeros(())
+        metrics["hip_fold"] = jp.zeros(())
+        metrics["release_ready"] = jp.zeros(())
+        metrics["knees_popped"] = jp.zeros(())
+        metrics["hips_released"] = jp.zeros(())
+        metrics["inverted"] = jp.zeros(())
         metrics["back_contact"] = jp.zeros(())
+        metrics["heel_planted"] = jp.zeros(())
+        metrics["recovery_ready"] = jp.zeros(())
+        metrics["stand_stable"] = jp.zeros(())
 
         contact = jp.array(
             [
@@ -390,24 +506,134 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         )
         action_w_delay = action_history.reshape((-1, self._actuators))[action_idx[0]]
 
-        motor_targets = (
-            self._default_actuator + action_w_delay * self._config.action_scale
+        prev_motor_targets = state.info["motor_targets"]
+        motor_targets = jp.array(self._default_actuator)
+        max_delta = self._config.max_motor_velocity * self.dt
+        pre_head = jp.clip(
+            self._pre_fold_head_targets,
+            prev_motor_targets[self._head_pitch_indices] - max_delta,
+            prev_motor_targets[self._head_pitch_indices] + max_delta,
+        )
+        pre_hips = jp.clip(
+            self._pre_fold_hip_targets,
+            prev_motor_targets[self._hip_pitch_indices] - max_delta,
+            prev_motor_targets[self._hip_pitch_indices] + max_delta,
+        )
+        pre_knees = jp.clip(
+            self._pre_fold_knee_targets,
+            prev_motor_targets[self._knee_indices] - max_delta,
+            prev_motor_targets[self._knee_indices] + max_delta,
+        )
+        pre_fold_targets = motor_targets.at[self._head_pitch_indices].set(pre_head)
+        pre_fold_targets = pre_fold_targets.at[self._hip_pitch_indices].set(
+            pre_hips
+        )
+        pre_fold_targets = pre_fold_targets.at[self._knee_indices].set(pre_knees)
+        pre_fold_targets = pre_fold_targets.at[self._ankle_indices].set(
+            self._pre_fold_ankle_targets
+        )
+        knee_pop_targets = motor_targets.at[self._head_pitch_indices].set(pre_head)
+        knee_pop_targets = knee_pop_targets.at[self._hip_pitch_indices].set(
+            [1.22, -1.22]
+        )
+        # Extending the knee toward zero drives the head-plant push.
+        knee_pop_targets = knee_pop_targets.at[self._knee_indices].set(
+            [0.0, 0.0]
+        )
+        knee_pop_targets = knee_pop_targets.at[self._ankle_indices].set(
+            [0.0, 0.0]
+        )
+        hip_pop_targets = knee_pop_targets.at[self._hip_pitch_indices].set(
+            [0.0, 0.0]
+        )
+        knee_pop_targets = jp.clip(
+            knee_pop_targets,
+            prev_motor_targets - max_delta,
+            prev_motor_targets + max_delta,
+        )
+        hip_pop_targets = jp.clip(
+            hip_pop_targets,
+            prev_motor_targets - max_delta,
+            prev_motor_targets + max_delta,
+        )
+        launch_time = state.info["step"] * self.dt
+        launch_targets = jp.where(
+            launch_time < self._launch_crouch_duration,
+            self._launch_crouch_targets,
+            jp.where(
+                launch_time < self._launch_push_end,
+                self._launch_push_targets,
+                pre_fold_targets,
+            ),
+        )
+        launch_targets = jp.clip(
+            launch_targets,
+            prev_motor_targets - max_delta,
+            prev_motor_targets + max_delta,
+        )
+        knee_pop_stage = state.info["release_ready"] & (
+            ~state.info["knees_popped"]
+        )
+        hip_pop_stage = (
+            state.info["release_ready"]
+            & state.info["knees_popped"]
+            & (~state.info["hips_released"])
+        )
+        motor_targets = jp.where(
+            knee_pop_stage,
+            knee_pop_targets,
+            jp.where(
+                hip_pop_stage,
+                hip_pop_targets,
+                jp.where(
+                    state.info["head_contacted"],
+                    jp.where(
+                        state.info["hips_released"],
+                        jp.where(
+                            state.info["heel_planted"],
+                            self._recovery_targets,
+                            self._heel_targets,
+                        ),
+                        pre_fold_targets,
+                    ),
+                    launch_targets,
+                ),
+            ),
+        )
+        recovery_pose = jp.where(
+            jp.all(state.info["last_contact"]),
+            self._recovery_targets,
+            self._heel_targets,
+        )
+        motor_targets = jp.where(
+            state.info["recovery_ready"], recovery_pose, motor_targets
         )
 
-        if USE_MOTOR_SPEED_LIMITS:
-            prev_motor_targets = state.info["motor_targets"]
-            motor_targets = jp.clip(
-                motor_targets,
-                prev_motor_targets - self._config.max_motor_velocity * self.dt,
-                prev_motor_targets + self._config.max_motor_velocity * self.dt,
-            )
-        # Forward roll only needs sagittal leg joints. Locking head, hip-yaw,
-        # and hip-roll motors prevents the policy from folding the body/head
-        # sideways or backwards to exploit contact.
-        motor_targets = jp.where(
-            self._roll_action_mask, motor_targets, self._default_actuator
+        # The phase script is a nominal motion prior. The policy remains active
+        # as a residual in every phase so it can tune push timing and contact
+        # torque instead of being overwritten by the script.
+        residual_scale = jp.where(
+            state.info["head_contacted"],
+            self._config.action_scale,
+            self._config.pre_head_action_scale,
         )
-        # Head/neck may lower during the roll, but must never bend backwards.
+        active_action_mask = jp.where(
+            state.info["recovery_ready"],
+            self._recovery_action_mask,
+            self._roll_action_mask,
+        )
+        motor_targets = motor_targets + (
+            action_w_delay
+            * residual_scale
+            * active_action_mask.astype(motor_targets.dtype)
+        )
+        motor_targets = jp.where(
+            active_action_mask, motor_targets, self._default_actuator
+        )
+        motor_targets = jp.clip(
+            motor_targets, self._soft_lowers, self._soft_uppers
+        )
+        # Negative neck/head pitch folds the chin toward the chest.
         head_targets = jp.clip(
             motor_targets[self._head_pitch_indices],
             self._head_pitch_lower,
@@ -416,6 +642,12 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         motor_targets = motor_targets.at[self._head_pitch_indices].set(
             head_targets
         )
+        if USE_MOTOR_SPEED_LIMITS:
+            motor_targets = jp.clip(
+                motor_targets,
+                prev_motor_targets - self._config.max_motor_velocity * self.dt,
+                prev_motor_targets + self._config.max_motor_velocity * self.dt,
+            )
 
         data = mjx_env.step(self.mjx_model, state.data, motor_targets, self.n_substeps)
         state.info["motor_targets"] = motor_targets
@@ -429,14 +661,62 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         head_contact = geoms_colliding(
             data, self._head_geom_id, self._floor_geom_id
         )
+        joint_angles_now = self.get_actuator_joints_qpos(data.qpos)
+        head_fold_angles = joint_angles_now[self._head_pitch_indices]
+        hip_fold_angles = joint_angles_now[self._hip_pitch_indices]
+        knee_angles_now = joint_angles_now[self._knee_indices]
+        # Left/right hip axes are mirrored: positive on the left and negative
+        # on the right produce the same physical forward fold.
+        hip_fold = (hip_fold_angles[0] >= 0.6) & (
+            hip_fold_angles[1] <= -0.6
+        )
+        knees_extended_now = (knee_angles_now[0] <= 0.2) & (
+            knee_angles_now[1] <= 0.2
+        )
+        deep_fold = (
+            (head_fold_angles[0] <= self._config.reward_config.deep_fold_neck)
+            & (head_fold_angles[1] <= self._config.reward_config.deep_fold_head)
+            & hip_fold
+        )
+        deep_head_contact = head_contact & deep_fold
         state.info["head_contact"] = head_contact
+        state.info["deep_fold"] = deep_fold
+        state.info["hip_fold"] = hip_fold
         state.info["head_contacted"] = (
-            state.info["head_contacted"] | head_contact
+            state.info["head_contacted"] | deep_head_contact
         )
         state.info["head_contact_steps"] = jp.where(
-            head_contact,
-            jp.minimum(state.info["head_contact_steps"] + 1, 10),
+            deep_head_contact,
+            jp.minimum(state.info["head_contact_steps"] + 1, 20),
             state.info["head_contact_steps"],
+        )
+        forward_xy = state.info["roll_forward"].at[2].set(0.0)
+        forward_xy = forward_xy / jp.maximum(jp.linalg.norm(forward_xy), 1e-6)
+        head_support = data.geom_xpos[self._head_geom_id]
+        body_com = data.subtree_com[self._torso_body_id]
+        com_offset = (body_com - head_support).at[2].set(0.0)
+        com_forward_of_head = jp.dot(com_offset, forward_xy)
+        up_world = data.site_xmat[self._site_id][:, 2]
+        release_ready_now = state.info["head_contacted"] & (
+            com_forward_of_head
+            >= self._config.reward_config.head_release_com_tolerance
+        ) & (
+            up_world[2] <= self._config.reward_config.head_release_up_z
+        ) & (
+            knee_angles_now[0] >= self._config.reward_config.head_release_knee
+        ) & (
+            knee_angles_now[1] >= self._config.reward_config.head_release_knee
+        )
+        state.info["release_ready"] = (
+            state.info["release_ready"] | release_ready_now
+        )
+        state.info["knees_popped"] = state.info["knees_popped"] | (
+            state.info["release_ready"] & knees_extended_now
+        )
+        state.info["hips_released"] = state.info["hips_released"] | (
+            state.info["knees_popped"]
+            & (jp.abs(hip_fold_angles[0]) <= 0.2)
+            & (jp.abs(hip_fold_angles[1]) <= 0.2)
         )
         back_contact = geoms_colliding(
             data, self._trunk_geom_id, self._floor_geom_id
@@ -456,7 +736,6 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         # velocity. Small back-and-forth jitter then cancels out and cannot be
         # mistaken for completing a full forward roll.
         gravity = self._get_body_gravity(data)
-        up_world = data.site_xmat[self._site_id][:, 2]
         roll_forward = state.info["roll_forward"]
         roll_angle = jp.arctan2(
             jp.dot(up_world, roll_forward),
@@ -480,6 +759,18 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         old_progress = jp.clip(old_roll / ROLL_SUCCESS_ANGLE, 0.0, 1.0)
         new_progress = jp.clip(new_roll / ROLL_SUCCESS_ANGLE, 0.0, 1.0)
         state.info["accumulated_roll"] = new_roll
+        state.info["recovery_ready"] = state.info["recovery_ready"] | (
+            new_roll
+            >= (
+                self._config.reward_config.recovery_roll_fraction
+                * ROLL_SUCCESS_ANGLE
+            )
+        )
+        state.info["inverted"] = state.info["inverted"] | (
+            state.info["head_contacted"]
+            & state.info["release_ready"]
+            & (up_world[-1] < -0.5)
+        )
 
         # _get_reward is a reward-rate function and step() multiplies it by dt.
         # Divide by dt here so the integrated progress bonus is scale * delta
@@ -496,36 +787,77 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         base_height_now = data.qpos[self._floating_base_qpos_addr + 2]
         made_progress = (new_roll - old_roll) > 0.005
+        grounded = (
+            (base_height_now < 0.09)
+            | state.info["head_contact"]
+            | state.info["back_contact"]
+        )
         state.info["stalled_steps"] = jp.where(
-            (base_height_now < 0.09) & (~made_progress),
+            grounded & (~made_progress),
             state.info["stalled_steps"] + 1,
             0,
         )
         upright_now = gravity[-1] < -0.7
         feet_touching_now = jp.any(contact)
+        heel_support = (
+            state.info["hips_released"]
+            & state.info["back_contacted"]
+            & feet_touching_now
+        )
+        state.info["heel_contact_steps"] = jp.where(
+            heel_support,
+            jp.minimum(state.info["heel_contact_steps"] + 1, 100),
+            0,
+        )
+        heel_plant_now = (
+            state.info["heel_contact_steps"]
+            >= self._config.reward_config.heel_support_steps
+        ) & (~state.info["heel_planted"])
+        state.info["heel_support"] = heel_support
+        state.info["heel_plant_now"] = heel_plant_now.astype(jp.float32)
+        state.info["heel_planted"] = state.info["heel_planted"] | heel_plant_now
         roll_complete_now = new_roll >= ROLL_SUCCESS_ANGLE
         complete_now = roll_complete_now & (~state.info["roll_completed"])
         state.info["roll_complete_now"] = complete_now.astype(jp.float32)
         state.info["roll_completed"] = (
             state.info["roll_completed"] | complete_now
         )
-        success_condition = (
+        sequence_completed = (
             roll_complete_now
-            & upright_now
-            & (base_height_now > 0.10)
-            & feet_touching_now
+            | state.info["heel_planted"]
+            | state.info["recovery_ready"]
         )
+        both_feet_touching = jp.all(contact)
+        gyro = self.get_gyro(data)
+        joint_velocity = self.get_actuator_joints_qvel(data.qvel)
+        stable_now = (
+            sequence_completed
+            & (gravity[-1] < -0.90)
+            & (base_height_now > 0.13)
+            & both_feet_touching
+            & (jp.linalg.norm(gyro) < 0.5)
+            & (jp.linalg.norm(joint_velocity) < 1.0)
+        )
+        state.info["stand_steps"] = jp.where(
+            stable_now,
+            jp.minimum(
+                state.info["stand_steps"] + 1,
+                self._config.reward_config.stable_stand_steps,
+            ),
+            0,
+        )
+        state.info["stand_stable"] = (
+            state.info["stand_steps"]
+            >= self._config.reward_config.stable_stand_steps
+        )
+        success_condition = state.info["stand_stable"]
         success_now = success_condition & (~state.info["roll_success"])
         state.info["roll_success_now"] = success_now.astype(jp.float32)
         state.info["roll_success"] = state.info["roll_success"] | success_now
 
         obs = self._get_obs(data, state.info, contact)
         done = self._get_termination(data, state.info)
-        done = (
-            done
-            | (state.info["roll_success_now"] > 0.5)
-            | ((ROLL_PHASE == 0) & (state.info["roll_complete_now"] > 0.5))
-        )
+        done = done | (state.info["roll_success_now"] > 0.5)
 
         rewards = self._get_reward(
             data, action, state.info, state.metrics, done, first_contact, contact
@@ -562,7 +894,26 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         state.metrics["head_contact"] = state.info["head_contact"].astype(
             jp.float32
         )
+        state.metrics["deep_fold"] = state.info["deep_fold"].astype(jp.float32)
+        state.metrics["hip_fold"] = state.info["hip_fold"].astype(jp.float32)
+        state.metrics["release_ready"] = state.info["release_ready"].astype(
+            jp.float32
+        )
+        state.metrics["knees_popped"] = state.info["knees_popped"].astype(
+            jp.float32
+        )
+        state.metrics["hips_released"] = state.info["hips_released"].astype(
+            jp.float32
+        )
+        state.metrics["inverted"] = state.info["inverted"].astype(jp.float32)
         state.metrics["back_contact"] = state.info["back_contact"].astype(
+            jp.float32
+        )
+        state.metrics["heel_planted"] = state.info["heel_plant_now"]
+        state.metrics["recovery_ready"] = state.info["recovery_ready"].astype(
+            jp.float32
+        )
+        state.metrics["stand_stable"] = state.info["stand_stable"].astype(
             jp.float32
         )
 
@@ -582,15 +933,19 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # robot after it has become stationary instead of letting it farm
             # a long episode by twitching on the ground.
             settled = info["stalled_steps"] > 40
-            incomplete = (
-                info["accumulated_roll"] < ROLL_SUCCESS_ANGLE - 0.5
+            incomplete = ~(
+                info["heel_planted"]
+                | (info["accumulated_roll"] >= ROLL_SUCCESS_ANGLE - 0.5)
             )
             return nan_term | (settled & incomplete)
 
         # Do not terminate around 180 degrees: that is the dead point the
         # policy must learn to pass. Reset only after it stops progressing.
         settled = info["stalled_steps"] > 40
-        incomplete = info["accumulated_roll"] < ROLL_SUCCESS_ANGLE - 0.5
+        incomplete = ~(
+            info["heel_planted"]
+            | (info["accumulated_roll"] >= ROLL_SUCCESS_ANGLE - 0.5)
+        )
         return nan_term | (settled & incomplete)
 
     # ------------------------------------------------------------------
@@ -740,49 +1095,25 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
 
         # Joint order: left hip/knee/ankle, right hip/knee/ankle.
         # Tuck first, then extend through the upside-down contact dead point.
-        tuck_target = jp.array(
-            [
-                1.0,
-                1.5,
-                self._default_actuator[4],
-                -1.0,
-                1.5,
-                self._default_actuator[13],
-            ]
-        )
-        release_target = jp.array([0.0, 0.5, -0.5, 0.0, 0.5, -0.5])
+        tuck_target = jp.array([1.22, 1.5, -1.2, -1.22, 1.5, -1.2])
+        deep_head = jp.array([-0.349, -0.785])
+        knee_pop_target = jp.array([1.22, 0.0, -1.2, -1.22, 0.0, -1.2])
+        hip_pop_target = jp.array([0.0, 0.0, -1.2, 0.0, 0.0, -1.2])
         heel_target = jp.array([-0.8, 0.3, 1.0, 0.8, 0.3, 1.0])
-        if ROLL_PHASE == 0:
-            release_blend = jp.where(
-                info["head_contacted"] & (info["head_contact_steps"] >= 2),
-                1.0,
-                0.0,
-            )
-        else:
-            release_blend = jp.clip(
-                (
-                    info["accumulated_roll"]
-                    - self._config.reward_config.tuck_release_start
-                )
-                / (
-                    self._config.reward_config.tuck_release_end
-                    - self._config.reward_config.tuck_release_start
-                ),
-                0.0,
-                1.0,
-            )
-        heel_blend = jp.where(
-            info["back_contacted"]
-            & (info["accumulated_roll"] > 2.5),
-            1.0,
-            0.0,
+        knee_pop_stage = info["release_ready"] & (~info["knees_popped"])
+        hip_pop_stage = (
+            info["release_ready"]
+            & info["knees_popped"]
+            & (~info["hips_released"])
         )
-        pose_target = (
-            (1.0 - release_blend) * tuck_target
-            + release_blend * release_target
-        )
-        pose_target = (
-            (1.0 - heel_blend) * pose_target + heel_blend * heel_target
+        headstand_ready = info["recovery_ready"]
+        pose_target = jp.where(info["release_ready"], hip_pop_target, tuck_target)
+        pose_target = jp.where(knee_pop_stage, knee_pop_target, pose_target)
+        pose_target = jp.where(headstand_ready, heel_target, pose_target)
+        pose_target = jp.where(
+            info["recovery_ready"],
+            self._default_actuator[self._roll_joint_indices],
+            pose_target,
         )
         joint_angles = self.get_actuator_joints_qpos(data.qpos)
         pose_angles = joint_angles[self._roll_joint_indices]
@@ -790,15 +1121,49 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         pose_error = jp.mean(jp.square(pose_angles - pose_target))
         tuck_reward = jp.exp(-pose_error / 0.25)
         head_angles = joint_angles[self._head_pitch_indices]
-        head_error = jp.mean(jp.square(head_angles - jp.array([-0.25, -0.65])))
-        head_reward = jp.exp(-head_error / 0.08)
+        heel_head_target = jp.array([-0.1, -0.25])
+        desired_head = jp.where(
+            jp.reshape(headstand_ready, (1,)), heel_head_target, deep_head
+        )
+        head_error = jp.mean(jp.square(head_angles - desired_head))
+        head_reward = (
+            jp.exp(-head_error / 0.08)
+            * (~info["heel_planted"]).astype(jp.float32)
+        )
         # Do not reward tucking before the body has actually left upright.
         # Otherwise the cheapest policy is to collapse onto the trunk.
         tuck_active = (
-            (info["accumulated_roll"] > 0.5)
-            & (info["accumulated_roll"] < ROLL_SUCCESS_ANGLE - 0.4)
+            (info["accumulated_roll"] < ROLL_SUCCESS_ANGLE - 0.4)
+            & (~info["heel_planted"])
+            & (~info["recovery_ready"])
         )
         tuck_reward *= tuck_active
+
+        hip_target = jp.array([1.22, -1.22])
+        hip_fold_error = jp.mean(
+            jp.square(pose_angles[jp.array([0, 3])] - hip_target)
+        )
+        hip_fold_reward = (
+            jp.exp(-hip_fold_error / 0.2)
+            * (~info["head_contacted"]).astype(jp.float32)
+            * (~info["recovery_ready"]).astype(jp.float32)
+        )
+
+        knee_pop_error = jp.mean(jp.square(pose_angles - knee_pop_target))
+        knee_pop_reward = (
+            jp.exp(-knee_pop_error / 0.15) * knee_pop_stage.astype(jp.float32)
+        )
+        hip_pop_error = jp.mean(jp.square(pose_angles - hip_pop_target))
+        hip_pop_reward = (
+            jp.exp(-hip_pop_error / 0.2) * hip_pop_stage.astype(jp.float32)
+        )
+
+        heel_error = jp.mean(jp.square(pose_angles - heel_target))
+        heel_reward = (
+            jp.exp(-heel_error / 0.2)
+            * headstand_ready.astype(jp.float32)
+            * (~info["heel_planted"]).astype(jp.float32)
+        )
 
         trunk_contact = geoms_colliding(
             data, self._trunk_geom_id, self._floor_geom_id
@@ -818,9 +1183,13 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
         # Once one turn has been accumulated, encourage the robot to become
         # upright again. This shaping is zero before the first full turn.
         has_completed_rotation = (
-            info["accumulated_roll"] >= ROLL_SUCCESS_ANGLE
+            (info["accumulated_roll"] >= ROLL_SUCCESS_ANGLE)
+            | info["heel_planted"]
+            | info["recovery_ready"]
         )
-        landing_supported = jp.any(contact) & (base_height > 0.10)
+        # Reward the recovery gradient as soon as both feet are loaded; the
+        # stricter height requirement belongs only to the terminal success.
+        landing_supported = jp.all(contact)
         upright_shaping = jp.where(
             has_completed_rotation,
             jp.clip(-gravity[-1], 0.0, 1.0) * landing_supported,
@@ -832,6 +1201,15 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             jp.exp(-recovery_error / 0.12)
             * has_completed_rotation.astype(jp.float32)
             * landing_supported.astype(jp.float32)
+        )
+        stand_height_reward = (
+            jp.exp(-jp.square((base_height - 0.15) / 0.05))
+            * has_completed_rotation.astype(jp.float32)
+            * landing_supported.astype(jp.float32)
+        )
+        foot_contact_reward = (
+            jp.mean(contact.astype(jp.float32))
+            * info["recovery_ready"].astype(jp.float32)
         )
 
         ret = {
@@ -856,10 +1234,18 @@ class Roll(open_duck_mini_v2_base.OpenDuckMiniV2Env):
             # ground rewards twitching.
             "stagnation": jp.array(0.0),
             "tuck_pose": tuck_reward,
+            "hip_fold": hip_fold_reward,
             "head_down": head_reward,
+            "knee_pop": knee_pop_reward,
+            "hip_pop": hip_pop_reward,
+            "heel": heel_reward,
+            "heel_plant": info["heel_plant_now"] / self.dt,
             "sitting": sitting_upright.astype(jp.float32),
             "recovery": recovery_reward,
+            "stand_height": stand_height_reward,
+            "foot_contact": foot_contact_reward,
             "landing": upright_shaping,
+            "stable_stand": info["stand_stable"].astype(jp.float32),
             # Divide by dt because step() multiplies the summed reward by dt.
             # Thus a success bonus of 20 is paid once, not every frame.
             "roll_success": info["roll_success_now"] / self.dt,

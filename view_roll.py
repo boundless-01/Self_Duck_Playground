@@ -10,10 +10,11 @@ data = mujoco.MjData(model)
 paused = False
 
 # ===== 可调参数 =====
-BEND_ANGLE   = 1.0    # 弯腰角度（髋关节），关节上限约 1.22
-ANKLE_COMP   = -1.0   # 踝关节补偿，让脚掌保持贴地（符号要试）
-NECK_PITCH   = -0.3   # 脖子低头，关节下限约 -0.349
-HEAD_PITCH   = -0.7   # 头再低，关节下限约 -0.785
+BEND_ANGLE   = 1.2    # 正值：左髋向前折；右髋取相反数
+KNEE_ANGLE   = 1.5    # 正值：收腿团身
+ANKLE_COMP   = -1.2   # 团身时勾脚，避免脚掌把身体撑开
+NECK_PITCH   = -0.3   # 负值：下巴向胸口低头
+HEAD_PITCH   = -0.7   # 负值：头部继续向前下折
 HEIGHT       = 0.22   # 身体高度（腿直立时的站立高度，需按模型调）
 
 def set_bend_pose():
@@ -21,38 +22,50 @@ def set_bend_pose():
     data.qpos[:] = model.keyframe("home").qpos  # 保留有效的基座四元数
     data.qpos[2] = HEIGHT                       # 高度
 
-    # ---- 腿：膝盖锁 0，保持直立 ----
+    # ---- 腿：按左右镜像的关节方向团身 ----
     # 左腿
-    data.qpos[9]  = BEND_ANGLE   # left_hip_pitch  -> 弯腰主力
-    data.qpos[10] = 0.0          # left_knee       -> 直立
-    data.qpos[11] = ANKLE_COMP   # left_ankle      -> 脚掌贴地补偿
+    left_hip_addr = model.jnt_qposadr[model.joint("left_hip_pitch").id]
+    left_knee_addr = model.jnt_qposadr[model.joint("left_knee").id]
+    left_ankle_addr = model.jnt_qposadr[model.joint("left_ankle").id]
+    right_hip_addr = model.jnt_qposadr[model.joint("right_hip_pitch").id]
+    right_knee_addr = model.jnt_qposadr[model.joint("right_knee").id]
+    right_ankle_addr = model.jnt_qposadr[model.joint("right_ankle").id]
+    neck_addr = model.jnt_qposadr[model.joint("neck_pitch").id]
+    head_addr = model.jnt_qposadr[model.joint("head_pitch").id]
+
+    data.qpos[left_hip_addr] = BEND_ANGLE
+    data.qpos[left_knee_addr] = KNEE_ANGLE
+    data.qpos[left_ankle_addr] = ANKLE_COMP
     # 右腿
-    data.qpos[18] = -BEND_ANGLE  # right_hip_pitch，轴向与左髋相反
-    data.qpos[19] = 0.0          # right_knee
-    data.qpos[20] = ANKLE_COMP   # right_ankle
+    data.qpos[right_hip_addr] = -BEND_ANGLE
+    data.qpos[right_knee_addr] = KNEE_ANGLE
+    data.qpos[right_ankle_addr] = ANKLE_COMP
 
     # ---- 头颈：低头 ----
-    data.qpos[12] = NECK_PITCH
-    data.qpos[13] = HEAD_PITCH
+    data.qpos[neck_addr] = NECK_PITCH
+    data.qpos[head_addr] = HEAD_PITCH
 
     # Hold the displayed pose when simulation is resumed.
     data.ctrl[:] = model.keyframe("home").ctrl
-    data.ctrl[2] = BEND_ANGLE       # left_hip_pitch
-    data.ctrl[3] = 0.0              # left_knee
-    data.ctrl[4] = ANKLE_COMP       # left_ankle
-    data.ctrl[5] = NECK_PITCH       # neck_pitch
-    data.ctrl[6] = HEAD_PITCH       # head_pitch
-    data.ctrl[11] = -BEND_ANGLE     # right_hip_pitch
-    data.ctrl[12] = 0.0             # right_knee
-    data.ctrl[13] = ANKLE_COMP      # right_ankle
+    ctrl = lambda name: model.actuator(name).id
+    data.ctrl[ctrl("left_hip_pitch")] = BEND_ANGLE
+    data.ctrl[ctrl("left_knee")] = KNEE_ANGLE
+    data.ctrl[ctrl("left_ankle")] = ANKLE_COMP
+    data.ctrl[ctrl("neck_pitch")] = NECK_PITCH
+    data.ctrl[ctrl("head_pitch")] = HEAD_PITCH
+    data.ctrl[ctrl("right_hip_pitch")] = -BEND_ANGLE
+    data.ctrl[ctrl("right_knee")] = KNEE_ANGLE
+    data.ctrl[ctrl("right_ankle")] = ANKLE_COMP
 
     data.qvel[:] = 0
     mujoco.mj_forward(model, data)
 
     # 打印头部世界坐标，方便判断是否触地
-    head_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "head")
+    head_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "head_collision"
+    )
     if head_id >= 0:
-        print("head pos:", data.xpos[head_id])
+        print("head collision center:", data.geom_xpos[head_id])
 
 def key_callback(keycode):
     global paused
